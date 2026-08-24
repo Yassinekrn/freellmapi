@@ -1,0 +1,6 @@
+{
+    "rewrites": [
+          { "source": "/api/:path*", "destination": "https://freellmapi-19vj.onrender.com/api/:path*" },
+          { "source": "/v1/:path*", "destination": "https://freellmapi-19vj.onrender.com/v1/:path*" }
+    ]
+}
