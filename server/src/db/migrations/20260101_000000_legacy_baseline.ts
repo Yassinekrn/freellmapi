@@ -2239,7 +2239,7 @@ function backfillFallback(db: Db) {
 function ensureUnifiedKey(db: Db) {
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
   if (!existing) {
-    const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
+    const key = process.env.FREEAPI_UNIFIED_API_KEY?.trim() || `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
     // Straight to stdout, deliberately bypassing the console redaction installed
     // in index.ts: this is the one intentional disclosure of the key, and the
