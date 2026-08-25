@@ -126,3 +126,26 @@ export function resetUserPassword(newPassword: string): boolean {
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
   return true;
 }
+
+/**
+ * Create or update the single dashboard account from env vars, so the login
+ * survives a redeploy on hosts with no persistent disk (mirrors declarative
+ * key seeding via FREEAPI_CONFIG_JSON). No-op unless both vars are set.
+ */
+export function bootstrapAdminAccountFromEnv(): void {
+    const email = process.env.FREEAPI_ADMIN_EMAIL?.trim();
+    const password = process.env.FREEAPI_ADMIN_PASSWORD;
+    if (!email || !password) return;
+
+  const db = getDb();
+    const normalized = normalizeEmail(email);
+    const existing = db.prepare('SELECT id FROM users LIMIT 1').get() as { id: number } | undefined;
+    if (existing) {
+          db.prepare('UPDATE users SET email = ?, password_hash = ? WHERE id = ?')
+            .run(normalized, hashPassword(password), existing.id);
+          console.log('[config] admin account synced from FREEAPI_ADMIN_EMAIL/FREEAPI_ADMIN_PASSWORD');
+          return;
+    }
+    db.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)').run(normalized, hashPassword(password));
+    console.log('[config] admin account created from FREEAPI_ADMIN_EMAIL/FREEAPI_ADMIN_PASSWORD');
+}
