@@ -172,6 +172,41 @@ function pollinationsVoice(requested?: string): string {
   return voice && POLLINATIONS_VOICES.has(voice) ? voice : 'alloy';
 }
 
+// ElevenLabs premade voices (stable ids from its default library; usable on the
+// free tier through the API). OpenAI names map onto the closest-sounding one.
+const ELEVENLABS_DEFAULT_VOICE = '21m00Tcm4TlvDq8ikWAM'; // Rachel
+const ELEVENLABS_VOICE_MAP: Record<string, string> = {
+  alloy: '21m00Tcm4TlvDq8ikWAM', // Rachel
+  ash: 'yoO6OSHBMeFS4RiGNqvJ', // Sam
+  ballad: 'VR6AewLTigWG4xSOukaG', // Arnold
+  coral: 'AZnzlk1XvdvUeBnXmlld', // Domi
+  echo: 'TxGEqnHWrfWFTfGW9XjX', // Josh
+  fable: 'ErXwobaYiN019PkySvjV', // Antoni
+  nova: 'EXAVITQu4vr4xnSDxMaL', // Bella
+  onyx: 'pNInz6obpgDQGcFmaJgB', // Adam
+  sage: 'MF3mGyEYCl7XYWbV9V6O', // Elli
+  shimmer: 'MF3mGyEYCl7XYWbV9V6O', // Elli
+  verse: 'TxGEqnHWrfWFTfGW9XjX', // Josh
+};
+// A native ElevenLabs voice_id is a 20-char alphanumeric string.
+const ELEVENLABS_VOICE_ID = /^[A-Za-z0-9]{20}$/;
+
+function elevenLabsVoice(requested?: string): string {
+  const raw = requested?.trim();
+  // Checked before lowercasing: ids are case-sensitive.
+  if (raw && ELEVENLABS_VOICE_ID.test(raw)) return raw;
+  const name = normalizedVoice(raw);
+  return (name && ELEVENLABS_VOICE_MAP[name]) || ELEVENLABS_DEFAULT_VOICE;
+}
+
+/** Only formats the free tier can produce: mp3_44100_128 and pcm_24000. Others
+ *  (192kbps mp3, 44.1k pcm) need Pro, and opus/wav/aac/flac are not offered
+ *  consistently, so they fall back to mp3 and the caller gets the true type. */
+function elevenLabsOutput(requested?: string): { outputFormat: string; contentType: string } {
+  if (requested === 'pcm') return { outputFormat: 'pcm_24000', contentType: contentTypeFor('pcm') };
+  return { outputFormat: 'mp3_44100_128', contentType: contentTypeFor('mp3') };
+}
+
 function geminiVoice(requested?: string): string {
   const voice = normalizedVoice(requested);
   if (!voice) return 'Kore';
@@ -213,7 +248,11 @@ interface ProviderCredential {
   baseUrl: string | null;
 }
 
-function getProviderCredential(row: Pick<MediaModelRow, 'platform' | 'key_id'>): ProviderCredential | null {
+function getProviderCredential(
+  row: Pick<MediaModelRow, 'platform' | 'key_id'>,
+  /** Keys already tried (and failed) for this request, so a retry picks another. */
+  excludeKeyIds: ReadonlySet<number> = new Set(),
+): ProviderCredential | null {
   if (row.key_id != null) {
     const keyRow = getDb()
       .prepare("SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') LIMIT 1")
@@ -231,8 +270,12 @@ function getProviderCredential(row: Pick<MediaModelRow, 'platform' | 'key_id'>):
   }
   if (row.platform === 'custom') return null;
 
+  // Ids are integers from our own loop, so inlining them is injection-safe.
+  const exclusion = excludeKeyIds.size > 0
+    ? ` AND id NOT IN (${[...excludeKeyIds].map(id => Math.trunc(id)).join(',')})`
+    : '';
   const keyRow = getDb()
-    .prepare("SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY RANDOM() LIMIT 1")
+    .prepare(`SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')${exclusion} ORDER BY RANDOM() LIMIT 1`)
     .get(row.platform) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
   if (!keyRow) return null;
   try {
@@ -653,6 +696,20 @@ async function callSpeechProvider(
         }),
       });
       return { audio: Buffer.from(await r.arrayBuffer()), contentType: contentTypeFor(fmt) };
+    }
+    case 'elevenlabs': {
+      const { outputFormat, contentType } = elevenLabsOutput(p.format);
+      const r = await mediaFetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoice(p.voice)}?output_format=${outputFormat}`,
+        'elevenlabs',
+        'audio',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'xi-api-key': key ?? '' },
+          body: JSON.stringify({ text: p.input, model_id: row.model_id }),
+        },
+      );
+      return { audio: Buffer.from(await r.arrayBuffer()), contentType };
     }
     case 'pollinations': {
       // OpenAI-shaped chat-completions with the audio modality returns b64 audio.
@@ -1079,26 +1136,107 @@ export async function runTranscription(model: string | undefined, p: Transcripti
   throw chainError('transcription', lastError);
 }
 
-/** Synthesize speech, failing over across providers serving the modality. */
+/** What a failed ElevenLabs call says about the KEY (not the request):
+ *  'invalid' = rejected credential, 'exhausted' = monthly credits spent,
+ *  'blocked' = free tier disabled for this IP, 'rate-limited' = back off.
+ *  ElevenLabs reports quota and abuse blocks as HTTP 401, so the body status
+ *  has to be inspected before a 401 is read as a bad key. */
+type KeyFailure = 'invalid' | 'exhausted' | 'blocked' | 'rate-limited';
+
+function elevenLabsKeyFailure(e: MediaError): KeyFailure | null {
+  const msg = e.message.toLowerCase();
+  if (msg.includes('detected_unusual_activity') || msg.includes('unusual activity')) return 'blocked';
+  if (msg.includes('quota_exceeded')) return 'exhausted';
+  if (e.status === 429) return 'rate-limited';
+  if (e.status === 401) return msg.includes('missing_permissions') ? null : 'invalid';
+  return null;
+}
+
+const KEY_FAILURE_COOLDOWN_MS: Record<Exclude<KeyFailure, 'invalid'>, number> = {
+  'rate-limited': 60_000,
+  // Credits reset monthly and the IP block is not short-lived; retrying a key
+  // in either state only burns requests, so bench it for hours, not seconds.
+  exhausted: 6 * 60 * 60_000,
+  blocked: 6 * 60 * 60_000,
+};
+
+/** Bench a failed ElevenLabs key. Credits and IP blocks are per account, so
+ *  every ElevenLabs model row is cooled, not just the one that failed. */
+function applyKeyFailure(chain: MediaModelRow[], keyId: number, failure: KeyFailure, detail: string): void {
+  if (failure === 'invalid') {
+    // Same terminal state the health checker uses; it re-probes and can revive the key.
+    getDb()
+      .prepare("UPDATE api_keys SET status = 'invalid', last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
+      .run(detail.slice(0, 300), keyId);
+    return;
+  }
+  for (const r of chain) {
+    if (r.platform === 'elevenlabs') setCooldown(r.platform, r.model_id, keyId, KEY_FAILURE_COOLDOWN_MS[failure]);
+  }
+}
+
+/** Synthesize speech, failing over across providers serving the modality.
+ *  ElevenLabs keys are per-account free allowances, so a key-level failure
+ *  moves on to another ElevenLabs key before the chain moves to the next
+ *  provider. */
 export async function runSpeech(model: string | undefined, params: SpeechParams): Promise<SpeechResult> {
   const chain = resolveMediaChain(model, 'audio');
   let lastError: MediaError | null = null;
   for (const row of chain) {
-    const credential = KEYLESS_CAPABLE.has(row.platform)
-      ? { id: null, key: null, baseUrl: null }
-      : getProviderCredential(row);
-    if (!credential) continue;
-    const started = Date.now();
-    try {
-      const out = await callSpeechProvider(row, credential, params);
-      if (!out.audio.length) throw new MediaError('upstream returned no audio', 502);
-      logMedia(row, credential.id, 'success', Date.now() - started, null);
-      return { platform: row.platform, modelId: row.model_id, audio: out.audio, contentType: out.contentType };
-    } catch (err: any) {
-      const e = err instanceof MediaError ? err : new MediaError(String(err?.message ?? err), 502);
-      logMedia(row, credential.id, 'error', Date.now() - started, e.message.slice(0, 300));
-      lastError = e;
+    const rotatesKeys = row.platform === 'elevenlabs' && row.key_id == null;
+    const triedKeyIds = new Set<number>();
+    for (;;) {
+      const credential = KEYLESS_CAPABLE.has(row.platform)
+        ? { id: null, key: null, baseUrl: null }
+        : getProviderCredential(row, triedKeyIds);
+      if (!credential) break;
+      if (rotatesKeys && credential.id != null && isOnCooldown(row.platform, row.model_id, credential.id)) {
+        triedKeyIds.add(credential.id);
+        continue;
+      }
+      const started = Date.now();
+      try {
+        const out = await callSpeechProvider(row, credential, params);
+        if (!out.audio.length) throw new MediaError('upstream returned no audio', 502);
+        logMedia(row, credential.id, 'success', Date.now() - started, null);
+        return { platform: row.platform, modelId: row.model_id, audio: out.audio, contentType: out.contentType };
+      } catch (err: any) {
+        const e = err instanceof MediaError ? err : new MediaError(String(err?.message ?? err), 502);
+        logMedia(row, credential.id, 'error', Date.now() - started, e.message.slice(0, 300));
+        lastError = e;
+        const failure = rotatesKeys && credential.id != null ? elevenLabsKeyFailure(e) : null;
+        if (failure && credential.id != null) {
+          applyKeyFailure(chain, credential.id, failure, e.message);
+          triedKeyIds.add(credential.id);
+          continue; // try another ElevenLabs key for this model
+        }
+        break;
+      }
     }
   }
   throw chainError('audio', lastError);
+}
+
+// ElevenLabs rows are seeded locally rather than by catalog-sync: the
+// published catalog does not list this platform, and ElevenLabs is deliberately
+// NOT in MEDIA_PLATFORMS so a sync never prunes these rows. Ordered cheapest
+// first (flash costs 0.5 credit/char on the 10k/month free allowance).
+const ELEVENLABS_TTS_MODELS: { id: string; name: string; note: string }[] = [
+  { id: 'eleven_flash_v2_5', name: 'ElevenLabs Flash v2.5', note: 'Free: 10k credits/mo per account (0.5/char)' },
+  { id: 'eleven_turbo_v2_5', name: 'ElevenLabs Turbo v2.5', note: 'Free: 10k credits/mo per account (0.5/char)' },
+  { id: 'eleven_multilingual_v2', name: 'ElevenLabs Multilingual v2', note: 'Free: 10k credits/mo per account (1/char)' },
+];
+
+/** Idempotently add the ElevenLabs TTS rows. Called at startup and whenever an
+ *  ElevenLabs key is added; never overrides a row the operator disabled. */
+export function ensureElevenLabsModels(): void {
+  const db = getDb();
+  const hasKey = db.prepare("SELECT 1 FROM api_keys WHERE platform = 'elevenlabs' LIMIT 1").get();
+  if (!hasKey) return;
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label)
+    VALUES ('elevenlabs', ?, ?, 'audio', ?, 1, ?)
+  `);
+  const maxPriority = (db.prepare("SELECT COALESCE(MAX(priority), 0) AS p FROM media_models WHERE modality = 'audio'").get() as { p: number }).p;
+  ELEVENLABS_TTS_MODELS.forEach((m, i) => insert.run(m.id, m.name, maxPriority + 1 + i, m.note));
 }

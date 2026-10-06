@@ -253,6 +253,17 @@ curl http://localhost:3001/v1/videos/generations \
   --output video.mp4
 ```
 
+### ElevenLabs text-to-speech
+
+Add one or more ElevenLabs API keys on the **Keys** page (platform **ElevenLabs**, create them at <https://elevenlabs.io/app/settings/api-keys>). Adding a key enables three audio models: `eleven_flash_v2_5` (0.5 credit/char), `eleven_turbo_v2_5` and `eleven_multilingual_v2` (1 credit/char). Request one by id, or leave `model` as `auto` to let it fail over from other audio providers.
+
+- Several keys rotate at random per request. A key that is rate limited, out of credits (`quota_exceeded`) or blocked (`detected_unusual_activity`) is benched and the next key is used; a rejected key (401) is marked invalid.
+- `voice` accepts an OpenAI name (`alloy`, `nova`, ...), which is mapped to an ElevenLabs premade voice, or a raw ElevenLabs `voice_id`. Unknown names use Rachel.
+- `response_format` supports `mp3` (default, `mp3_44100_128`) and `pcm` (`pcm_24000`). Other formats fall back to mp3, and the `Content-Type` reflects what was actually returned.
+- Free tier is 10,000 credits per month per account.
+
+Terms of use: ElevenLabs allows one free account per person and IP, and may disable the free tier from datacenter or VPN IPs with the error `Unusual activity detected. Free Tier usage disabled`. Use keys from your own account, for your own non-commercial use, and expect hosted deployments (for example Render) to be blocked more often than a local run. This gateway does not work around those limits.
+
 ## Fusion (multi-model synthesis)
 
 Request the virtual `fusion` model and the router fans your prompt out to a panel of diverse free models in parallel, then a judge model synthesizes one answer from the drafts. Panel, judge, and strategy are configurable on the dashboard's **Fusion** page or per request via the `fusion` field; each sub-call goes through normal routing, quotas, and analytics.

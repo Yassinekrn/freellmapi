@@ -47,6 +47,7 @@ export const PLATFORMS: { value: Platform; label: string; url: string; keyless?:
   { value: 'agnes', label: 'Agnes AI (free key)', url: 'https://platform.agnes-ai.com' },
   { value: 'reka', label: 'Reka (free key)', url: 'https://platform.reka.ai' },
   { value: 'siliconflow', label: 'SiliconFlow (image + TTS)', url: 'https://siliconflow.com' },
+  { value: 'elevenlabs', label: 'ElevenLabs (TTS only)', url: 'https://elevenlabs.io/app/settings/api-keys' },
   { value: 'routeway', label: 'Routeway (free key)', url: 'https://routeway.ai' },
   { value: 'bazaarlink', label: 'BazaarLink (free key)', url: 'https://bazaarlink.ai' },
   { value: 'ainative', label: 'AINative Studio (free key)', url: 'https://ainative.studio' },

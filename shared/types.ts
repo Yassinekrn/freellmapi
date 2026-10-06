@@ -99,6 +99,9 @@ export type Platform =
   // models (FLUX.1-schnell image, CosyVoice2 TTS) routed via services/media.ts;
   // chat is supported too. Key from siliconflow.com (no card).
   | 'siliconflow'
+  // ElevenLabs — text-to-speech only, routed via services/media.ts. Free tier is
+  // 10,000 credits/month per account; key from elevenlabs.io (no card).
+  | 'elevenlabs'
   // Routeway — OpenAI-compatible aggregator. Free ':free' models ($0) on a
   // rate-limited pool (~5 rpm observed); requires a browser User-Agent (CF
   // blocks others). Key from routeway.ai (no card).

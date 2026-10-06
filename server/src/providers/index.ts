@@ -7,6 +7,7 @@ import { CloudflareProvider } from './cloudflare.js';
 import { AIHordeProvider } from './aihorde.js';
 import { ModelScopeProvider } from './modelscope.js';
 import { PollinationsProvider } from './pollinations.js';
+import { ElevenLabsProvider } from './elevenlabs.js';
 import { ZhipuProvider } from './zhipu.js';
 
 const providers = new Map<Platform, BaseProvider>();
@@ -272,6 +273,11 @@ register(new OpenAICompatProvider({
   name: 'SiliconFlow',
   baseUrl: 'https://api.siliconflow.com/v1',
 }));
+
+// ElevenLabs — text-to-speech only (free tier: 10,000 credits/month per
+// account). Registered so keys can be stored, validated and rotated; synthesis
+// is an audio adapter in services/media.ts and there are no chat models.
+register(new ElevenLabsProvider());
 
 // Routeway — OpenAI-compatible aggregator (api.routeway.ai/v1). Free models
 // carry a ':free' suffix and cost $0; the free pool is rate-limited (docs say

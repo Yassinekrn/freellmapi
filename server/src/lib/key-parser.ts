@@ -59,6 +59,8 @@ export const PREFIX_MAP: Record<string, string> = {
   AGNES_: 'agnes',
   REKA_: 'reka',
   SILICONFLOW_: 'siliconflow',
+  ELEVENLABS_: 'elevenlabs',
+  ELEVEN_LABS_: 'elevenlabs',
   ROUTEWAY_: 'routeway',
   BAZAARLINK_: 'bazaarlink',
   AINATIVE_: 'ainative',

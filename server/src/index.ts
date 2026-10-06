@@ -1,6 +1,7 @@
 import './env.js';
 import { createApp } from './app.js';
 import { initDb, getDb } from './db/index.js';
+import { ensureElevenLabsModels } from './services/media.js';
 import { startHealthChecker, checkAllKeys } from './services/health.js';
 import { restoreProxySettings, flushProxyCache } from './lib/proxy.js';
 import { startWakeDetect } from './lib/wake-detect.js';
@@ -43,6 +44,7 @@ async function main() {
   }
   initDb(config.dbPath ?? undefined);
   applyDeclarativeConfigFromEnv();
+  ensureElevenLabsModels();
   bootstrapAdminAccountFromEnv();
   // After initDb: the unknown-model half of this check reads the catalog.
   warnOnRoutingOverrideDrift();
