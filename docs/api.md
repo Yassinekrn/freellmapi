@@ -259,6 +259,7 @@ Add one or more ElevenLabs API keys on the **Keys** page (platform **ElevenLabs*
 
 - Several keys rotate at random per request. A key that is rate limited, out of credits (`quota_exceeded`) or blocked (`detected_unusual_activity`) is benched and the next key is used; a rejected key (401) is marked invalid.
 - `voice` accepts an OpenAI name (`alloy`, `nova`, ...), which is mapped to an ElevenLabs premade voice, or a raw ElevenLabs `voice_id`. Unknown names use Rachel.
+- **Free-tier caveat:** ElevenLabs blocks "library" voices over the API for free accounts (`402 paid_plan_required`), and the voices behind the OpenAI-name mapping, including the Rachel default, can fall into that group. On a free key, pass a raw `voice_id` that works for you (verified against a deployed instance on 2026-10-12: `EXAVITQu4vr4xnSDxMaL`, `JBFqnCBsd6RMkjVDRZzb`, `pNInz6obpgDQGcFmaJgB` with `eleven_flash_v2_5`). `GET /v1/voices` on your own key lists what the account can use. The OpenAI-name mapping is not yet adapted to free accounts.
 - `response_format` supports `mp3` (default, `mp3_44100_128`) and `pcm` (`pcm_24000`). Other formats fall back to mp3, and the `Content-Type` reflects what was actually returned.
 - Free tier is 10,000 credits per month per account.
 
