@@ -11,15 +11,78 @@ import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
 import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
-import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import { recordQuotaObservation, recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import type { QuotaMetric } from '@freellmapi/shared/types.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 import { isAbortLikeError } from '../lib/error-classify.js';
+import { contentToString } from '../lib/content.js';
+import { bearerAuthHeader } from '../lib/credential.js';
+
+// Shared with the media/embeddings custom-endpoint paths; re-exported so
+// existing imports keep working (#1331).
+export { isAnonymousCredential } from '../lib/credential.js';
+
+/** Hosts that ARE Moonshot's OpenAI-compatible API (api.moonshot.ai,
+ * api.moonshot.cn, api.kimi.com and their subdomains). */
+const MOONSHOT_HOST_SUFFIXES = ['moonshot.ai', 'moonshot.cn', 'kimi.com'];
+
+/**
+ * Whether a base URL points at Moonshot's own API. Moonshot documents an
+ * assistant-message `partial: true` prefill flag that no other OpenAI-compatible
+ * upstream understands, and there is no built-in moonshot platform — Kimi
+ * models are otherwise served by Groq, Cloudflare, OpenRouter, Hugging Face,
+ * Ollama, ... — so the flag is gated on the endpoint host, never on the model
+ * id. Returns false for anything that does not parse as a URL. (#1038)
+ */
+export function isMoonshotEndpoint(baseUrl: string): boolean {
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return MOONSHOT_HOST_SUFFIXES.some((d) => host === d || host.endsWith(`.${d}`));
+}
+
+/**
+ * Some free-tier upstreams (notably Pollinations) answer HTTP 200 but put an
+ * out-of-credits / top-up notice in the assistant message instead of returning
+ * a 402. That reads as a successful completion, so the fallback loop never
+ * rotates off the dead key (#pollinations-inband). Detect the notice so callers
+ * can throw a payment-required error and fail over. Kept deliberately tight —
+ * requires the credits phrase AND a top-up/quest/Pollinations marker — so a
+ * genuine reply that merely discusses credits does not trip it.
+ */
+export function inBandCreditsError(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  const mentionsCredits = t.includes('enough credits') || t.includes('insufficient credit');
+  if (!mentionsCredits) return null;
+  const topUpMarker =
+    t.includes('top up') || t.includes('top-up') ||
+    t.includes('complete a quest') || t.includes('pollinations');
+  if (!topUpMarker) return null;
+  return text.trim().slice(0, 200);
+}
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
  * Covers: Groq, Cerebras, NVIDIA NIM, Mistral, OpenRouter,
  * GitHub Models, Fireworks AI.
  */
+/** A provider's key-info/quota endpoint (#1403): the GET URL and the JSON
+ * field names carrying the limit and the remaining balance. Fields are looked
+ * up first under a `data` wrapper (OpenRouter style), then at the top level.
+ * `credits` are in the provider's own currency (OpenRouter USD, SiliconFlow
+ * CNY); `notes` names it. Only a reading with a limit feeds routing headroom. */
+export interface QuotaProbeSpec {
+  url: string;
+  metric: QuotaMetric;
+  limitFields: string[];
+  remainingFields: string[];
+  notes?: string;
+}
+
 export class OpenAICompatProvider extends BaseProvider {
   readonly platform: Platform;
   readonly name: string;
@@ -34,6 +97,11 @@ export class OpenAICompatProvider extends BaseProvider {
    * `400 This model only supports single tool-calls at once!`. When set, pin
    * parallel_tool_calls to false whenever tools are in play. See issue #255. */
   private readonly forceSingleToolCall: boolean;
+  /** True only for a custom endpoint whose host is Moonshot's own API; see
+   * isMoonshotEndpoint(). Gates the assistant `partial` prefill flag (#1038). */
+  private readonly forwardsPartial: boolean;
+  /** Optional provider-reported quota endpoint (#1403). */
+  private readonly quotaProbe?: QuotaProbeSpec;
 
   constructor(opts: {
     platform: Platform;
@@ -44,6 +112,7 @@ export class OpenAICompatProvider extends BaseProvider {
     timeoutMs?: number;
     keyless?: boolean;
     forceSingleToolCall?: boolean;
+    quotaProbe?: QuotaProbeSpec;
   }) {
     super();
     this.platform = opts.platform;
@@ -55,6 +124,8 @@ export class OpenAICompatProvider extends BaseProvider {
     this.timeoutMs = providerTimeoutMs(opts.platform, opts.timeoutMs ?? 60_000);
     this.keyless = opts.keyless ?? false;
     this.forceSingleToolCall = opts.forceSingleToolCall ?? false;
+    this.forwardsPartial = opts.platform === 'custom' && isMoonshotEndpoint(opts.baseUrl);
+    this.quotaProbe = opts.quotaProbe;
   }
 
   /** Resolve the parallel_tool_calls flag to send upstream. For providers that
@@ -114,17 +185,22 @@ export class OpenAICompatProvider extends BaseProvider {
     return res.statusText;
   }
 
-  /** Keyless providers (Kilo's anonymous free tier) must send NO Authorization
-   * header — a stored sentinel like `Bearer no-key` could be treated as an
-   * invalid key. Everyone else sends the bearer as usual. */
+  /** Anonymous access sends NO Authorization header: keyless providers
+   * (Kilo's anonymous free tier) holding the stored `no-key` sentinel, and
+   * custom endpoints whose stored credential is the same sentinel with auth
+   * off. Sending `Bearer no-key` upstream is never right — upstreams read it
+   * as an invalid key. A REAL key saved on a keyless platform is used instead
+   * of the anonymous path, and a real key on a custom endpoint still gets its
+   * bearer (#1331): the presence of a credential decides at request time —
+   * Kilo, OVH and AI Horde all accept both modes per their docs. */
   private authHeader(apiKey: string): Record<string, string> {
-    return this.keyless ? {} : { 'Authorization': `Bearer ${apiKey}` };
+    return bearerAuthHeader(apiKey);
   }
 
   /** Requesty's Leanstral route rejects greedy sampling when temperature=0.
    * Omitting that value and supplying a neutral top_p keeps the caller's intent
    * deterministic enough while using the provider's supported sampling path. */
-  private samplingForModel(modelId: string, options?: CompletionOptions): {
+  protected samplingForModel(modelId: string, options?: CompletionOptions): {
     temperature: number | undefined;
     topP: number | undefined;
   } {
@@ -138,45 +214,83 @@ export class OpenAICompatProvider extends BaseProvider {
     return { temperature: options?.temperature, topP: options?.top_p };
   }
 
-  /** Mistral's OpenAI-compatible endpoint is strict about unknown nested fields
-   * and returns 422 for provider-private replay fields that other gateways
-   * ignore. Keep the OpenAI wire shape, but strip our internal reasoning /
-   * thought-signature extensions before sending to Mistral. */
-  private messagesForPlatform(messages: ChatMessage[]): ChatMessage[] {
-    if (this.platform !== 'mistral') return messages;
+  /**
+   * OpenAI-compatible endpoints that are strict about unknown nested fields:
+   * Mistral returns 422 for provider-private replay fields, Groq rejects
+   * assistant `reasoning_content` with 400 (verified in production, #1070),
+   * and Cerebras rejects it too — `property 'messages.N.assistant.
+   * reasoning_content' is unsupported` (confirmed via vercel/ai#15042 and
+   * opencode#26762, and by Cerebras' own docs, which use a `reasoning` field
+   * instead). Other gateways ignore the fields, so keep the OpenAI wire
+   * shape but strip our internal reasoning / thought-signature extensions
+   * before sending to these platforms.
+   */
+  private static readonly STRICT_PLATFORMS = new Set(['mistral', 'groq', 'cerebras']);
+  private messagesForPlatform(messages: ChatMessage[], modelId: string): ChatMessage[] {
+    if (OpenAICompatProvider.STRICT_PLATFORMS.has(this.platform)) {
+      // Rebuild every message from a whitelist of keys, so `partial` and the
+      // reasoning extensions never reach these platforms.
+      return messages.map((m) => {
+        if (m.role === 'assistant') {
+          return {
+            role: m.role,
+            content: m.content,
+            ...(m.name ? { name: m.name } : {}),
+            ...(m.tool_calls && m.tool_calls.length > 0 ? {
+              tool_calls: m.tool_calls.map((tc) => ({
+                id: tc.id,
+                type: tc.type,
+                function: {
+                  name: tc.function.name,
+                  arguments: tc.function.arguments,
+                },
+              })),
+            } : {}),
+          };
+        }
+        if (m.role === 'tool') {
+          return {
+            role: m.role,
+            content: m.content,
+            ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+            ...(m.name ? { name: m.name } : {}),
+          };
+        }
+        return {
+          role: m.role,
+          content: m.content,
+          ...(m.name ? { name: m.name } : {}),
+        };
+      });
+    }
 
-    return messages.map((m) => {
-      if (m.role === 'assistant') {
-        return {
-          role: m.role,
-          content: m.content,
-          ...(m.name ? { name: m.name } : {}),
-          ...(m.tool_calls && m.tool_calls.length > 0 ? {
-            tool_calls: m.tool_calls.map((tc) => ({
-              id: tc.id,
-              type: tc.type,
-              function: {
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-              },
-            })),
-          } : {}),
-        };
+    // Moonshot's assistant `partial` prefill flag only survives to the wire
+    // when this provider IS Moonshot's own API (a custom endpoint on a
+    // Moonshot/Kimi host). Every other OpenAI-compatible gateway — including
+    // the ones that serve Kimi models, like Groq, Cloudflare or OpenRouter —
+    // gets it stripped, since strict upstreams 400/422 on unknown message keys
+    // and the rest would ignore it anyway. (#1038)
+    const sanitized = this.forwardsPartial ? messages : messages.map((m) => {
+      if (m.role === 'assistant' && m.partial !== undefined) {
+        const { partial: _partial, ...rest } = m;
+        return rest;
       }
-      if (m.role === 'tool') {
-        return {
-          role: m.role,
-          content: m.content,
-          ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-          ...(m.name ? { name: m.name } : {}),
-        };
-      }
-      return {
-        role: m.role,
-        content: m.content,
-        ...(m.name ? { name: m.name } : {}),
-      };
+      return m;
     });
+
+    // Qwen3.8-Flash-Next accepts exactly one system message, and only at index
+    // zero. Profiles can prepend a gateway system prompt to a client's own
+    // system message, so coalesce every system instruction before dispatch
+    // instead of letting an otherwise valid request fail upstream.
+    if (this.platform === 'radeon' && modelId === 'Qwen3.8-Flash-Next') {
+      const systems = sanitized.filter(m => m.role === 'system');
+      if (systems.length === 1 && sanitized[0]?.role === 'system') return sanitized;
+      const systemText = systems.map(m => contentToString(m.content)).filter(Boolean).join('\n\n');
+      const rest = sanitized.filter(m => m.role !== 'system');
+      return systemText ? [{ role: 'system', content: systemText }, ...rest] : rest;
+    }
+
+    return sanitized;
   }
 
   async chatCompletion(
@@ -196,9 +310,9 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify({
         model: modelId,
-        messages: this.messagesForPlatform(messages),
+        messages: this.messagesForPlatform(messages, modelId),
         temperature: sampling.temperature,
-        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens, options?.contextBudget),
         top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
@@ -294,6 +408,16 @@ export class OpenAICompatProvider extends BaseProvider {
       );
     }
     normalizeChoices(data);
+    // #pollinations-inband: a 200 whose body is really an out-of-credits notice
+    // must fail over, not be returned as the answer. The "402 ... insufficient
+    // credit" wording makes isPaymentRequiredError classify it as retryable and
+    // bench the key with the day-long payment-required cooldown.
+    const creditsNotice = inBandCreditsError(
+      (data.choices ?? []).map(c => contentToString((c.message as ChatMessage)?.content)).join('\n'),
+    );
+    if (creditsNotice) {
+      throw new Error(`${this.name} API error 402: insufficient credit (upstream returned 200 with an out-of-credits notice): ${creditsNotice}`);
+    }
     data._routed_via = { platform: this.platform, model: modelId };
     return data;
   }
@@ -315,9 +439,9 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify({
         model: modelId,
-        messages: this.messagesForPlatform(messages),
+        messages: this.messagesForPlatform(messages, modelId),
         temperature: sampling.temperature,
-        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens, options?.contextBudget),
         top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
@@ -357,7 +481,41 @@ export class OpenAICompatProvider extends BaseProvider {
     // First-byte grace (#584): the same chat timeout that bounded the headers
     // also budgets the first stream read — NIM-style providers send SSE
     // headers instantly, then prefill long prompts for minutes.
-    yield* this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs });
+    yield* this.guardInBandCreditsError(
+      this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs }),
+    );
+  }
+
+  /**
+   * #pollinations-inband: wrap a chat stream so an in-band out-of-credits notice
+   * (a 200 that streams the top-up message as content) fails over instead of
+   * being shown as the answer. Only the FIRST content-bearing chunk is inspected
+   * — a Pollinations credits notice arrives as a single canned message — so the
+   * stream is otherwise byte-for-byte unchanged: reasoning/role chunks pass
+   * straight through (first-token ttfb intact) and every chunk after the first
+   * content one is untouched. Throwing on that first content chunk happens before
+   * it reaches the proxy's commit point, so the fallback loop can still rotate.
+   */
+  private async *guardInBandCreditsError(
+    src: AsyncGenerator<ChatCompletionChunk>,
+  ): AsyncGenerator<ChatCompletionChunk> {
+    let sawContent = false;
+    for await (const chunk of src) {
+      if (!sawContent) {
+        const content = (chunk.choices ?? [])
+          .map(c => (c.delta as { content?: unknown } | undefined)?.content)
+          .filter((c): c is string => typeof c === 'string')
+          .join('');
+        if (content) {
+          sawContent = true;
+          const notice = inBandCreditsError(content);
+          if (notice) {
+            throw new Error(`${this.name} API error 402: insufficient credit (upstream streamed an out-of-credits notice): ${notice}`);
+          }
+        }
+      }
+      yield chunk;
+    }
   }
 
   /** This provider's OpenAI-style model catalog URL. */
@@ -412,6 +570,75 @@ export class OpenAICompatProvider extends BaseProvider {
   async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     const res = await this.fetchCatalogEndpoint(this.validateUrl ?? this.modelsUrl, apiKey, quotaContext);
     return this.validationResult(res);
+  }
+
+  /**
+   * Provider-reported balance via the registered quotaProbe endpoint (#1403).
+   * GETs the key-info URL (e.g. OpenRouter's `GET /api/v1/key`), pulls the
+   * limit/remaining numbers out of the JSON (checking the `data` wrapper and
+   * the top level), and records them as a `source: 'quota_api'` observation.
+   * Never throws: a quota probe that fails says nothing about the key, and
+   * the caller's health verdict must stay about the key.
+   */
+  get hasQuotaProbe(): boolean {
+    return this.quotaProbe !== undefined;
+  }
+
+  async fetchQuota(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
+    const spec = this.quotaProbe;
+    if (!spec) return false;
+    try {
+      const res = await this.fetchWithTimeout(spec.url, {
+        method: 'GET',
+        headers: {
+          ...this.authHeader(apiKey),
+          ...this.extraHeaders,
+        },
+      }, 10_000, { timeoutBounds: 'request' });
+      if (!res.ok) return false;
+      const body: any = await res.json().catch(() => null);
+      const scope = (body && typeof body === 'object' && body.data && typeof body.data === 'object')
+        ? [body.data, body]
+        : [body];
+      const pick = (fields: string[]): number | null => {
+        for (const obj of scope) {
+          if (!obj || typeof obj !== 'object') continue;
+          for (const f of fields) {
+            const v = (obj as Record<string, unknown>)[f];
+            if (typeof v === 'number' && Number.isFinite(v)) return v;
+            // Some providers serialize balances as strings ("88.88", SiliconFlow
+            // /v1/user/info). Accept a numeric string; "", null and prose never
+            // parse to a finite number.
+            if (typeof v === 'string' && v.trim() !== '') {
+              const n = Number(v);
+              if (Number.isFinite(n)) return n;
+            }
+          }
+        }
+        return null;
+      };
+      const limit = pick(spec.limitFields);
+      const remaining = pick(spec.remainingFields);
+      if (limit === null && remaining === null) return false;
+      const record = recordQuotaObservation({
+        platform: this.platform,
+        keyId: quotaContext?.keyId,
+        providerAccountId: quotaContext?.providerAccountId,
+        quotaPoolKey: quotaContext?.quotaPoolKey,
+        endpoint: 'quota_api',
+        metric: spec.metric,
+        limit,
+        remaining,
+        resetStrategy: 'provider_reported',
+        source: 'quota_api',
+        statusCode: res.status,
+        notes: spec.notes ?? null,
+      });
+      return record !== null;
+    } catch {
+      // Transport/parse failure: inconclusive, never a key verdict (#1403).
+      return false;
+    }
   }
 }
 

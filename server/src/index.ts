@@ -8,6 +8,7 @@ import { startWakeDetect } from './lib/wake-detect.js';
 import { startCatalogSync } from './services/catalog-sync.js';
 import { startCooldownProbe } from './services/cooldown-probe.js';
 import { startCustomModelSync } from './services/custom-model-sync.js';
+import { startBuiltinModelDiscovery } from './services/builtin-model-discovery.js';
 import { installProcessSafetyNet } from './lib/process-safety-net.js';
 import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
@@ -20,6 +21,8 @@ import { warnOnEnvDrift } from './lib/env-drift.js';
 import { warnOnRoutingOverrideDrift } from './services/model-weight-overrides.js';
 import { installLogRedaction } from './lib/log-redaction.js';
 import { cleanupExpiredCooldowns } from './services/ratelimit.js';
+import { loadCacheFromDb } from './services/cache.js';
+import { installGracefulShutdown } from './lib/graceful-shutdown.js';
 
 // Before any other statement runs, so no provider key can reach stdout — users
 // paste server output into bug reports. Module scope, not inside main(), so it
@@ -48,6 +51,11 @@ async function main() {
   bootstrapAdminAccountFromEnv();
   // After initDb: the unknown-model half of this check reads the catalog.
   warnOnRoutingOverrideDrift();
+
+  // Reload the persisted response cache into the in-memory LRU so entries
+  // survive a restart (the daily quota-reset re-run pattern). Best-effort:
+  // a DB failure leaves the cache empty (memory-only), exactly as before.
+  loadCacheFromDb();
 
   // Cooldowns persist across restarts on purpose, but their expiry is collected
   // lazily (isOnCooldown, per model+key). Rows for routes nothing asks about
@@ -82,6 +90,7 @@ async function main() {
     startDbBackupPump(getDb(), scheduler, config.dbPath ?? undefined);
     startBackupScheduler(scheduler);
     startCustomModelSync(getDb(), scheduler);
+    startBuiltinModelDiscovery(getDb(), scheduler);
 
     // Post-sleep recovery: while the host was suspended (laptop lid, VM
     // pause) timers and keep-alive sockets froze, so the first requests after
@@ -105,7 +114,22 @@ async function main() {
     });
   };
 
+  // Keep idle sockets open LONGER than any fronting reverse proxy keeps them
+  // in its pool. Node's default keepAliveTimeout is 5s while Caddy (and nginx)
+  // reuse idle upstream connections for 30-60s, so the proxy periodically
+  // writes a request into a socket this server just closed and surfaces it to
+  // the user as a 502 "connection reset by peer". 75s clears both defaults;
+  // headersTimeout must stay above keepAliveTimeout or Node times the
+  // keep-alive socket out while the next request's headers are in flight.
+  const tuneKeepAlive = (s: ReturnType<typeof app.listen>) => {
+    s.keepAliveTimeout = 75_000;
+    s.headersTimeout = 76_000;
+  };
+
   const server = app.listen(Number(PORT), HOST, onReady(HOST));
+  tuneKeepAlive(server);
+  const servers = [server];
+  installGracefulShutdown({ servers: () => servers.filter(s => s.listening), closeDb: () => getDb().close?.() });
   server.on('error', (err: NodeJS.ErrnoException) => {
     // The default '::' bind fails where IPv6 is disabled (kernel
     // ipv6.disable=1 and the like) — retry IPv4-only rather than dying.
@@ -113,7 +137,9 @@ async function main() {
     // fail-fast posture documented in main().catch below.
     if (!process.env.HOST && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) {
       console.warn('[server] IPv6 unavailable on this host — falling back to 0.0.0.0 (IPv4-only)');
-      app.listen(Number(PORT), '0.0.0.0', onReady('0.0.0.0'));
+      const fallback = app.listen(Number(PORT), '0.0.0.0', onReady('0.0.0.0'));
+      tuneKeepAlive(fallback);
+      servers.push(fallback);
       return;
     }
     console.error('\n[server] Failed to start:\n  ' + (err?.message ?? err) + '\n');

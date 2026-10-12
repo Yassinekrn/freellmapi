@@ -28,7 +28,7 @@ export interface FallbackEntry {
   contextWindow?: number | null
   supportsVision: boolean
   supportsTools: boolean
-  source?: 'catalog' | 'custom'
+  source?: 'catalog' | 'custom' | 'discovered'
   keyId?: number | null
   keyLabel?: string | null
   // Which custom endpoint this row belongs to (its base URL), and the model id
@@ -103,6 +103,9 @@ export interface RoutingData {
   /** Key-selection policy (#919). Required for the same reason as
    *  exploreEnabled: the picker renders straight from GET /routing. */
   keySelectionStrategy: KeySelectionStrategy
+  /** Ceiling on the router's own cooldown guesses in ms (#952); null = no cap
+   *  (ladder tops out at 24h, 402/403 bench a day). */
+  cooldownCeilingMs: number | null
   scores: (RoutingScore & { platform: string; modelId: string; displayName: string; enabled: boolean })[]
 }
 
@@ -112,14 +115,16 @@ export type Row = FallbackEntry & Partial<RoutingScore>
 export interface TokenUsageData {
   totalBudget: number
   totalUsed: number
-  models: { displayName: string; platform: string; modelId?: string; budget: number; used?: number }[]
+  /** Served smartest-first (intelligenceRank 1 = smartest); the bar and its
+   *  legend keep that order. */
+  models: { displayName: string; platform: string; modelId?: string; intelligenceRank?: number; budget: number; used?: number }[]
 }
 
 // Custom endpoints all share the generic 'custom' platform id, so show the
 // user's key label ("Ollama box") instead so the models list names the actual
 // provider. Falls back to the platform for catalog models (and unlabeled custom
 // keys, whose label defaults to "Custom"). (#469)
-export function providerLabel(row: { platform: string; source?: 'catalog' | 'custom'; keyLabel?: string | null }): string {
+export function providerLabel(row: { platform: string; source?: 'catalog' | 'custom' | 'discovered'; keyLabel?: string | null }): string {
   if (row.source === 'custom' && row.keyLabel && row.keyLabel.trim()) return row.keyLabel
   return row.platform
 }
@@ -140,7 +145,7 @@ export function endpointShortLabel(scope: string): string {
  * so there is nothing new to notice until a real collision exists.
  */
 export function memberProviderLabel<T extends {
-  platform: string; modelId: string; source?: 'catalog' | 'custom'
+  platform: string; modelId: string; source?: 'catalog' | 'custom' | 'discovered'
   keyLabel?: string | null; endpointScope?: string | null
 }>(row: T, siblings: readonly T[]): string {
   const base = providerLabel(row)
@@ -159,7 +164,7 @@ export function memberProviderLabel<T extends {
  * when it is needed (#651).
  */
 function hasEndpointCollision<T extends {
-  platform: string; modelId: string; source?: 'catalog' | 'custom'; endpointScope?: string | null
+  platform: string; modelId: string; source?: 'catalog' | 'custom' | 'discovered'; endpointScope?: string | null
 }>(row: T, siblings: readonly T[]): boolean {
   if (row.source !== 'custom' || !row.endpointScope) return false
   const endpoints = new Set(siblings
@@ -177,7 +182,7 @@ function hasEndpointCollision<T extends {
  * single-endpoint install, which is exactly what #651 must not do.
  */
 export function memberEndpointTitle<T extends {
-  platform: string; modelId: string; source?: 'catalog' | 'custom'
+  platform: string; modelId: string; source?: 'catalog' | 'custom' | 'discovered'
   keyLabel?: string | null; endpointScope?: string | null
 }>(row: T, siblings: readonly T[]): string | undefined {
   if (memberProviderLabel(row, siblings) === providerLabel(row)) return undefined
@@ -190,7 +195,7 @@ export function memberEndpointTitle<T extends {
  * the endpoint-qualified id the server computed names one of them.
  */
 export function providerPinId<T extends {
-  platform: string; modelId: string; source?: 'catalog' | 'custom'
+  platform: string; modelId: string; source?: 'catalog' | 'custom' | 'discovered'
   endpointScope?: string | null; qualifiedModelId?: string | null
 }>(row: T, siblings: readonly T[]): string {
   if (!row.qualifiedModelId) return row.modelId
@@ -372,11 +377,57 @@ export function tightestRateLimit(
   return best
 }
 
+// ── Depleted rows (#1015) ────────────────────────────────────────────────────
+// A member is depleted when its tightest time-window quota (#876) is used up —
+// exactly the state that turns its RateLimitBadge red. A member with no usage
+// data is never depleted: an idle provider may simply not have been polled
+// yet, and there is no evidence it cannot serve.
+export function isMemberDepleted(usage: RateLimitUsageRow | undefined): boolean {
+  const tightest = usage ? tightestRateLimit([usage]) : null
+  return tightest !== null && tightest.used >= tightest.limit
+}
+
+// A group is depleted only when EVERY member is — the group stays routable
+// while any single provider has headroom, the same rule the group badge reads
+// from the best member. Members without usage data count as healthy here, so
+// the table only folds a row it can prove is exhausted across the board.
+export function isGroupDepleted(
+  members: readonly { modelDbId: number }[],
+  rateUsage: ReadonlyMap<number, RateLimitUsageRow>,
+): boolean {
+  return members.length > 0 && members.every(m => isMemberDepleted(rateUsage.get(m.modelDbId)))
+}
+
 export const platformColors: Record<string, string> = {
   google:      '#4285f4',
   groq:        '#f55036',
   cerebras:    '#8b5cf6',
+  sail:        '#0ea5e9',
+  aclide:      '#6366f1',
+  speka:       '#0d9488',
+  typhoon:     '#e11d48',
+  plugsky:     '#0284c7',
+  inferbase:   '#2563eb',
+  simplellm:   '#0d9488',
+  llmtr:       '#0f766e',
+  gizmo:       '#7c3aed',
+  blockrun:    '#2563eb',
+  moondream:   '#6d5dfc',
+  electronhub: '#6366f1',
+  experiential: '#14b8a6',
+  router9:      '#8b5cf6',
+  septor:       '#0891b2',
+  clod:         '#16a34a',
+  speechify:    '#7c3aed',
+  freeai:       '#16a34a',
+  blaze:        '#f97316',
+  lucidity:     '#6366f1',
+  airforce:     '#0ea5e9',
+  dreamprompting: '#db2777',
+  waterfall:    '#0d9488',
+  logfare:      '#ca8a04',
   bai:         '#111827',
+  radeon:      '#ed1c24',
   nvidia:      '#76b900',
   mistral:     '#f59e0b',
   openrouter:  '#ec4899',
@@ -421,7 +472,18 @@ export interface ModelGroupRow {
 // when ungrouped). Members are ordered like the flat chain — by manual priority
 // under the priority strategy, by live score otherwise — and groups inherit the
 // best member's position so the unified order matches the flat order.
-export function buildGroups(rows: Row[], isManual: boolean): ModelGroupRow[] {
+//
+// With rate-limit usage supplied (#1015) and the table ordering itself (score
+// mode), members and groups whose time-window quota is used up sink to the
+// bottom so healthy models stay on top. Both passes are stable sorts, so the
+// score order survives inside each partition. Manual mode deliberately opts
+// out: the visible order there is the operator's explicit drag-arranged ladder
+// and must not reshuffle under them (the graying still applies).
+export function buildGroups(
+  rows: Row[],
+  isManual: boolean,
+  rateUsage?: ReadonlyMap<number, RateLimitUsageRow>,
+): ModelGroupRow[] {
   const map = new Map<string, Row[]>()
   for (const r of rows) {
     const key = r.groupKey ?? `solo:${r.modelDbId}`
@@ -439,5 +501,52 @@ export function buildGroups(rows: Row[], isManual: boolean): ModelGroupRow[] {
       ? Math.min(...a.members.map(m => m.priority)) - Math.min(...b.members.map(m => m.priority))
       : Math.max(...b.members.map(m => m.score ?? 0)) - Math.max(...a.members.map(m => m.score ?? 0)),
   )
+  if (rateUsage && !isManual) {
+    const depleted = (m: Row) => isMemberDepleted(rateUsage.get(m.modelDbId))
+    for (const g of groups) g.members.sort((a, b) => Number(depleted(a)) - Number(depleted(b)))
+    groups.sort((a, b) => Number(isGroupDepleted(a.members, rateUsage)) - Number(isGroupDepleted(b.members, rateUsage)))
+  }
   return groups
+}
+
+// Clamp a typed 1-based rank (#1317) to a valid 0-based index into the visible
+// chain. Jump-to-rank edits clamp instead of erroring: 1 means "front", a
+// number past the end means "last", and garbage falls back to staying put.
+export function clampRankToIndex(toRank: number, length: number): number {
+  if (!Number.isFinite(toRank)) return -1
+  const i = Math.trunc(toRank) - 1
+  if (i < 0) return 0
+  return i > length - 1 ? length - 1 : i
+}
+
+/**
+ * Whether a search query matches a logical-model group (#1056). The hay covers
+ * everything the table can DISPLAY for the group: its label, canonical id, and
+ * every member's platform, display name and model id — plus, for custom rows,
+ * the key label and endpoint host the row is actually rendered with. Those last
+ * two are the fix: a relay added as a custom endpoint (UnoRouter, say) carries
+ * platform 'custom', so searching the provider's name found nothing even
+ * though the table prints "api.unorouter.com" on the row.
+ */
+export function groupMatchesQuery(
+  g: {
+    label: string
+    members: Array<{
+      platform: string; modelId: string; displayName: string
+      canonicalId?: string; source?: 'catalog' | 'custom' | 'discovered'
+      keyLabel?: string | null; endpointScope?: string | null
+    }>
+  },
+  query: string,
+): boolean {
+  const hay = [
+    g.label,
+    g.members[0].canonicalId ?? '',
+    ...g.members.map(m => m.platform),
+    ...g.members.map(m => m.displayName),
+    ...g.members.map(m => m.modelId),
+    ...g.members.map(m => m.keyLabel ?? ''),
+    ...g.members.map(m => m.endpointScope ? endpointShortLabel(m.endpointScope) : ''),
+  ].join(' ').toLowerCase()
+  return hay.includes(query)
 }

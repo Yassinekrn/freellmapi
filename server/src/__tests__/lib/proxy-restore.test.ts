@@ -1,15 +1,32 @@
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { initDb, getDb, setSetting } from '../../db/index.js';
 import {
   restoreProxySettings,
   getProxyUrl,
+  getProxyMode,
+  getFetchRelayToken,
   isProxyEnabled,
   getProxyBypassPlatforms,
   getNoProxyRules,
   applyProxyUrl,
+  applyProxyMode,
   applyProxyEnabled,
   applyProxyBypass,
+  applyFetchRelayToken,
+  encodeFetchRelayToken,
 } from '../../lib/proxy.js';
+
+// #838 reads the OS-wide proxy (scutil/reg/gsettings) as a last-resort
+// fallback when neither the env nor the DB configures one. A developer
+// machine can genuinely have that set (macOS System Settings → Proxies),
+// which fails every "no proxy configured" case below for the same reason
+// clearProxyEnv() exists — the ambient system, not the code under test.
+// '' parses as "no proxy" in every platform branch, so the suite sees a
+// clean machine regardless of the host's system settings.
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  execFileSync: () => '',
+}));
 
 // #949: the desktop embedder builds the app without server/src/index.ts, so
 // the proxy state it starts with is whatever the module defaults are — an
@@ -18,7 +35,7 @@ import {
 // is the single hydration step both entry points now call after initDb; this
 // test pins that the DB value actually reaches the process state.
 
-const PROXY_ENV_VARS = ['PROXY_URL', 'ALL_PROXY', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY'];
+const PROXY_ENV_VARS = ['PROXY_URL', 'PROXY_MODE', 'FETCH_RELAY_TOKEN', 'ALL_PROXY', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY'];
 
 function clearProxyEnv(): void {
   for (const name of PROXY_ENV_VARS) {
@@ -33,6 +50,8 @@ beforeEach(() => {
   clearProxyEnv();
   // Reset to the module defaults so each case starts from "fresh process".
   applyProxyUrl('');
+  applyProxyMode('forward');
+  applyFetchRelayToken('');
   applyProxyEnabled(true);
   applyProxyBypass('');
 });
@@ -78,6 +97,7 @@ describe('restoreProxySettings (desktop embedder hydration, #949)', () => {
     restoreProxySettings();
 
     expect(getProxyUrl()).toBe('');
+    expect(getProxyMode()).toBe('forward');
     expect(isProxyEnabled()).toBe(true);
     expect(getProxyBypassPlatforms()).toEqual([]);
   });
@@ -91,6 +111,43 @@ describe('restoreProxySettings (desktop embedder hydration, #949)', () => {
     restoreProxySettings();
 
     expect(getProxyUrl()).toBe('http://env:8080');
+    expect(getProxyMode()).toBe('forward');
+  });
+
+  it('restores an explicitly saved Fetch Relay mode', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+    setSetting('proxy_url', 'https://relay.example.test/secret');
+    setSetting('proxy_mode', 'fetch-relay');
+
+    restoreProxySettings();
+
+    expect(getProxyUrl()).toBe('https://relay.example.test/secret');
+    expect(getProxyMode()).toBe('fetch-relay');
+  });
+
+  it('restores a saved Relay token and lets FETCH_RELAY_TOKEN override it', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+    setSetting('fetch_relay_token', encodeFetchRelayToken('saved-token'));
+
+    restoreProxySettings();
+    expect(getFetchRelayToken()).toBe('saved-token');
+
+    process.env.FETCH_RELAY_TOKEN = 'environment-token';
+    restoreProxySettings();
+    expect(getFetchRelayToken()).toBe('environment-token');
+  });
+
+  it('lets PROXY_MODE opt an environment PROXY_URL into Fetch Relay', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+    process.env.PROXY_URL = 'https://relay.example.test/secret';
+    process.env.PROXY_MODE = 'fetch-relay';
+
+    restoreProxySettings();
+
+    expect(getProxyMode()).toBe('fetch-relay');
   });
 });
 

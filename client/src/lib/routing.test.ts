@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import {
+  buildGroups,
+  groupMatchesQuery,
+  isGroupDepleted,
+  isMemberDepleted,
   isMemberSplit,
   memberEndpointTitle,
   memberOverrideKey,
@@ -8,6 +12,8 @@ import {
   splitsWithoutMember,
   tightestRateLimit,
   type RateLimitUsageRow,
+  type Row,
+  clampRankToIndex,
 } from './routing'
 
 // Per-endpoint identity must be INVISIBLE until two endpoints actually serve the
@@ -258,5 +264,162 @@ describe('tightestRateLimit', () => {
       usageRow(2, { tpm: { used: 500, limit: 100_000 } }),
     ]
     expect(tightestRateLimit(rows)).toEqual({ kind: 'TPM', used: 500, limit: 100_000 })
+  })
+})
+
+// #1056: a relay added as a custom endpoint carries platform 'custom', so
+// searching the provider's name ("unorouter") found nothing even though the
+// table prints the endpoint host on the row.
+describe('groupMatchesQuery (#1056)', () => {
+  const member = (over: Record<string, unknown> = {}) => ({
+    platform: 'custom', modelId: 'glm-5.1', displayName: 'GLM 5.1',
+    source: 'custom' as const, keyLabel: null,
+    endpointScope: 'https://api.unorouter.com/v1', ...over,
+  })
+  const group = (members: ReturnType<typeof member>[]) => ({ label: 'GLM 5.1', members })
+
+  it('matches a custom endpoint host the table displays', () => {
+    expect(groupMatchesQuery(group([member()]), 'unorouter')).toBe(true)
+    expect(groupMatchesQuery(group([member()]), 'api.unorouter.com')).toBe(true)
+  })
+
+  it('matches the operator-given key label', () => {
+    const g = group([member({ endpointScope: null, keyLabel: 'My UnoRouter key' })])
+    expect(groupMatchesQuery(g, 'unorouter')).toBe(true)
+  })
+
+  it('matches when only ONE member of a multi-provider group is on that endpoint', () => {
+    const g = group([
+      member({ platform: 'zhipu', source: 'catalog' as const, endpointScope: null }),
+      member(),
+    ])
+    expect(groupMatchesQuery(g, 'unorouter')).toBe(true)
+    expect(groupMatchesQuery(g, 'zhipu')).toBe(true)
+  })
+
+  it('still matches names, ids and catalog platforms', () => {
+    const g = group([member({ platform: 'groq', source: 'catalog' as const, endpointScope: null })])
+    expect(groupMatchesQuery(g, 'glm')).toBe(true)
+    expect(groupMatchesQuery(g, 'groq')).toBe(true)
+    expect(groupMatchesQuery(g, 'mistral')).toBe(false)
+  })
+})
+
+// #1015: models whose time-window quota is used up gray out and sink to the
+// bottom of the table, so operators see healthy capacity first. The fold is
+// score-mode-only: manual mode is the operator's drag-arranged ladder.
+describe('depleted rows (#1015)', () => {
+  function chainRow(modelDbId: number, over: Partial<Row> = {}): Row {
+    return {
+      modelDbId,
+      priority: modelDbId,
+      effectivePriority: modelDbId,
+      penalty: 0,
+      rateLimitHits: 0,
+      enabled: true,
+      platform: 'groq',
+      modelId: 'm' + modelDbId,
+      displayName: 'M' + modelDbId,
+      intelligenceRank: 50,
+      speedRank: 50,
+      sizeLabel: '',
+      monthlyTokenBudget: '',
+      supportsVision: false,
+      supportsTools: false,
+      keyCount: 1,
+      ...over,
+    } as Row
+  }
+
+  const exhaustedUsage = (modelDbId: number) => usageRow(modelDbId, { rpm: { used: 30, limit: 30 } })
+  const healthyUsage = (modelDbId: number) => usageRow(modelDbId, { rpm: { used: 3, limit: 30 } })
+
+  it('isMemberDepleted: used-up tightest window is depleted', () => {
+    expect(isMemberDepleted(exhaustedUsage(1))).toBe(true)
+    expect(isMemberDepleted(healthyUsage(1))).toBe(false)
+  })
+
+  it('isMemberDepleted: no usage data or a fully idle member is not depleted', () => {
+    expect(isMemberDepleted(undefined)).toBe(false)
+    expect(isMemberDepleted(usageRow(1, { rpm: { used: 0, limit: 30 } }))).toBe(false)
+    expect(isMemberDepleted(usageRow(1, { rpm: { used: 5, limit: 0 } }))).toBe(false)
+  })
+
+  it('isGroupDepleted: only when every member is out of headroom', () => {
+    const members = [chainRow(1), chainRow(2)]
+    expect(isGroupDepleted(members, new Map([
+      [1, exhaustedUsage(1)],
+      [2, exhaustedUsage(2)],
+    ]))).toBe(true)
+    // One healthy provider keeps the group routable — same rule as the badge.
+    expect(isGroupDepleted(members, new Map([
+      [1, exhaustedUsage(1)],
+      [2, healthyUsage(2)],
+    ]))).toBe(false)
+    // A member we have never polled is not proven exhausted either.
+    expect(isGroupDepleted(members, new Map([[1, exhaustedUsage(1)]]))).toBe(false)
+  })
+
+  it('buildGroups sinks a depleted group below healthy ones, score order intact', () => {
+    const rows = [
+      chainRow(1, { score: 0.5 }),
+      // Depleted despite the best score: it cannot serve right now.
+      chainRow(2, { score: 0.9 }),
+      chainRow(3, { score: 0.7 }),
+    ]
+    const usage = new Map([[2, exhaustedUsage(2)]])
+    const groups = buildGroups(rows, false, usage)
+    // Healthy groups keep their score order (3 → 1); the depleted 2 sinks.
+    expect(groups.map(g => g.members[0].modelDbId)).toEqual([3, 1, 2])
+  })
+
+  it('buildGroups sinks depleted members within a group in score mode', () => {
+    const rows = [
+      chainRow(1, { score: 0.9, groupKey: 'g1', displayName: 'Shared' }),
+      chainRow(2, { score: 0.5, groupKey: 'g1', displayName: 'Shared' }),
+    ]
+    const usage = new Map([[1, exhaustedUsage(1)]])
+    const [group] = buildGroups(rows, false, usage)
+    expect(group.members.map(m => m.modelDbId)).toEqual([2, 1])
+  })
+
+  it('buildGroups leaves the manual ladder alone even with usage data', () => {
+    const rows = [
+      chainRow(1, { priority: 1, score: 0.1 }),
+      chainRow(2, { priority: 2, score: 0.9 }),
+    ]
+    const usage = new Map([[1, exhaustedUsage(1)]])
+    const groups = buildGroups(rows, true, usage)
+    expect(groups.map(g => g.members[0].modelDbId)).toEqual([1, 2])
+  })
+
+  it('buildGroups without usage data keeps the plain score order', () => {
+    const rows = [
+      chainRow(1, { score: 0.5 }),
+      chainRow(2, { score: 0.9 }),
+    ]
+    const groups = buildGroups(rows, false)
+    expect(groups.map(g => g.members[0].modelDbId)).toEqual([2, 1])
+  })
+})
+
+describe('clampRankToIndex (#1317)', () => {
+  const N = 10
+  it('maps a typed 1-based rank to the 0-based index', () => {
+    expect(clampRankToIndex(1, N)).toBe(0)
+    expect(clampRankToIndex(5, N)).toBe(4)
+    expect(clampRankToIndex(N, N)).toBe(N - 1)
+  })
+  it('clamps instead of erroring: below 1 goes to the front, past the end goes last', () => {
+    expect(clampRankToIndex(-3, N)).toBe(0)
+    expect(clampRankToIndex(0, N)).toBe(0)
+    expect(clampRankToIndex(999, N)).toBe(N - 1)
+  })
+  it('truncates fractional ranks', () => {
+    expect(clampRankToIndex(3.9, N)).toBe(2)
+  })
+  it('rejects unparseable values so the row stays put', () => {
+    expect(clampRankToIndex(Number.NaN, N)).toBe(-1)
+    expect(clampRankToIndex(Infinity, N)).toBe(-1)
   })
 })

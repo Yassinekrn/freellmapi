@@ -14,6 +14,11 @@ export const CLIENT_AGENTS = [
   'crush',
   'deepseek-harness',
   'mimo-code',
+  'atomcode',
+  'openclaw',
+  'hermes-agent',
+  'pi',
+  'reasonix',
   'cursor',
   'gemini-cli',
   'zed',
@@ -59,9 +64,26 @@ export function classifyClientAgent(req: Request): ClientAgent {
   // MiMo Code is an OpenCode derivative and can carry either name in its UA,
   // so it has to be tested before the plain `opencode` rule below.
   if (/mimo[- ]?code|\bmimo\//.test(ua)) return 'mimo-code';
+  // `atomcode/<version>`
+  if (/\batomcode\b/.test(ua)) return 'atomcode';
+  // OpenClaw names itself only through the static provider header our
+  // generator writes (`openclaw`); its own `openclaw/<version>` UA is reserved
+  // for endpoints it recognises.
+  if (/\bopenclaw\b/.test(ua)) return 'openclaw';
+  // Hermes Agent likewise only names itself to hosts it knows; the generator's
+  // `default_headers` sends `hermes-agent`, and its /v1/models probe sends
+  // `hermes-cli/<version>` on its own.
+  if (/hermes[- ]?agent|\bhermes-cli\b/.test(ua)) return 'hermes-agent';
+  // Pi likewise only names itself to hosts it knows; the generator's provider
+  // header sends `pi-coding-agent`, and Pi's own UA is
+  // `pi/<version> (<platform>; node/<version>; <arch>)`.
+  if (/\bpi-coding-agent\b|^pi\/\d/.test(ua)) return 'pi';
+  // Reasonix sends `Reasonix/<version>` to every endpoint on its own.
+  if (/^reasonix\//.test(ua)) return 'reasonix';
   if (/opencode/.test(ua)) return 'opencode';
   if (/\bcline\b/.test(ua)) return 'cline';
-  if (/\broo[- /]/.test(ua) || /roo code/.test(ua)) return 'roo';
+  // The Roo Code extension and CLI send `RooCode/<version>`.
+  if (/\broo[- /]/.test(ua) || /roo ?code/.test(ua)) return 'roo';
   if (/continue(?:\.dev)?/.test(ua)) return 'continue';
   if (/\baider\b/.test(ua)) return 'aider';
   if (/\bgoose\b/.test(ua)) return 'goose';

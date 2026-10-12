@@ -21,6 +21,9 @@ import { useI18n } from '@/i18n'
 import { apiFetch } from '@/lib/api'
 import {
   buildGroups,
+  clampRankToIndex,
+  isGroupDepleted,
+  groupMatchesQuery,
   groupMaxContext,
   type FallbackEntry,
   type ModelGroupRow,
@@ -45,6 +48,7 @@ import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
 import { PenaltyInspector } from '@/components/penalty-inspector'
 import { PeakHoursControls } from '@/components/peak-hours-controls'
+import { ReliabilityFloorControl } from '@/components/reliability-floor-control'
 import { ChainManager } from '@/components/chain-manager'
 
 // `tKey` is the i18n suffix under `strategies.*` (label) and `strategies.*Blurb`.
@@ -118,10 +122,21 @@ export default function FallbackPage() {
 
   const { data: entries = [], isLoading: entriesLoading } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback', 'chain', activeProfileId],
-    queryFn: () => apiFetch('/api/fallback'),
+    // The chain id rides in the request itself (#1047): keyed-but-unpinned, a
+    // refetch racing an activation fetched "whichever chain is active by now"
+    // into the OLD chain's cache entry, and switching A→B→A then rendered (and
+    // could save) B's rows under A's name until a hard refresh.
+    queryFn: () => apiFetch(activeProfileId != null ? `/api/fallback?profile=${activeProfileId}` : '/api/fallback'),
     enabled: !activePending,
   })
   const isLoading = activePending || entriesLoading
+
+  // Staged edits are DISCARDED when the active chain changes, not just hidden
+  // (#1047): merely masking them meant switching A→B→A resurrected A's stale
+  // unsaved rows over freshly fetched data, with only a refresh clearing them.
+  useEffect(() => {
+    setStaged(prev => (prev && prev.profileId !== activeProfileId ? null : prev))
+  }, [activeProfileId])
 
   const localEntries = staged && staged.profileId === activeProfileId ? staged.entries : null
   const setLocalEntries = (entries: FallbackEntry[] | null) =>
@@ -164,7 +179,7 @@ export default function FallbackPage() {
     mutationFn: (payload: {
       strategy: RoutingStrategy; weights?: RoutingWeights; exploreEnabled?: boolean
       peakHoursAdjust?: boolean; peakStartHour?: number; peakEndHour?: number; peakTimezone?: string
-      keySelectionStrategy?: KeySelectionStrategy
+      keySelectionStrategy?: KeySelectionStrategy; cooldownCeilingMs?: number | null
     }) =>
       apiFetch('/api/fallback/routing', { method: 'PUT', body: JSON.stringify(payload) }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] }),
@@ -174,15 +189,27 @@ export default function FallbackPage() {
   const keySelection: KeySelectionStrategy = routing?.keySelectionStrategy ?? 'auto'
   const isManual = strategy === 'priority'
 
-  // Merge fallback metadata with live scores, keyed by model.
-  const scoreById = new Map((routing?.scores ?? []).map(s => [s.modelDbId, s]))
-  const allEntries = localEntries ?? entries
-  const configured = allEntries.filter(e => e.keyCount > 0)
-  const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))]
+  // Merge fallback metadata with live scores, keyed by model. Memoized (#1047):
+  // recomputing these over the whole catalog on every render — and the page
+  // renders once per landing query plus once per 15s poll — was a large part of
+  // the "absurdly slow" feel on big catalogs.
+  const scoreById = useMemo(
+    () => new Map((routing?.scores ?? []).map(s => [s.modelDbId, s])),
+    [routing?.scores],
+  )
+  const allEntries = useMemo(() => localEntries ?? entries, [localEntries, entries])
+  const configured = useMemo(() => allEntries.filter(e => e.keyCount > 0), [allEntries])
+  const unconfiguredPlatforms = useMemo(
+    () => [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))],
+    [allEntries],
+  )
 
   // Entry fields win on overlap: the routing snapshot also carries `enabled`
   // (and identity fields), which would otherwise clobber unsaved local toggles.
-  const rows: Row[] = configured.map(e => ({ ...(scoreById.get(e.modelDbId) ?? {}), ...e }))
+  const rows: Row[] = useMemo(
+    () => configured.map(e => ({ ...(scoreById.get(e.modelDbId) ?? {}), ...e })),
+    [configured, scoreById],
+  )
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -205,31 +232,22 @@ export default function FallbackPage() {
 
   // ── Model unification: a model served by several providers is always shown as
   // one logical row that links to its own page (the on/off toggle was removed). ─
-  const orderedGroups = buildGroups(rows, isManual)
+  const orderedGroups = useMemo(() => buildGroups(rows, isManual, rateUsageByModel), [rows, isManual, rateUsageByModel])
 
   // Catalog search + filters (#343). Filtering operates on whole logical-model
   // groups; rank stays the model's position in the full chain so the numbers
   // don't renumber as you filter. Drag-to-reorder is only offered over the full,
   // unfiltered manual chain (reordering a filtered subset would be ambiguous).
-  const rankByKey = new Map(orderedGroups.map((g, i) => [g.key, i + 1]))
+  const rankByKey = useMemo(() => new Map(orderedGroups.map((g, i) => [g.key, i + 1])), [orderedGroups])
   const query = search.trim().toLowerCase()
   const filtersActive = query !== '' || filterVision || filterTools || minContext > 0
-  const visibleGroups = orderedGroups.filter(g => {
+  const visibleGroups = useMemo(() => orderedGroups.filter(g => {
     if (filterVision && !g.members.some(m => m.supportsVision)) return false
     if (filterTools && !g.members.some(m => m.supportsTools)) return false
     if (minContext > 0 && groupMaxContext(g.members) < minContext) return false
-    if (query) {
-      const hay = [
-        g.label,
-        g.members[0].canonicalId ?? '',
-        ...g.members.map(m => m.platform),
-        ...g.members.map(m => m.displayName),
-        ...g.members.map(m => m.modelId),
-      ].join(' ').toLowerCase()
-      if (!hay.includes(query)) return false
-    }
+    if (query && !groupMatchesQuery(g, query)) return false
     return true
-  })
+  }), [orderedGroups, filterVision, filterTools, minContext, query])
   const draggable = isManual && !filtersActive
 
   // Progressive rendering: grow the row budget whenever the sentinel below the
@@ -286,6 +304,19 @@ export default function FallbackPage() {
     const unconfigured = allEntries.filter(e => e.keyCount === 0).map(e => e.modelDbId)
     const prio = new Map([...order, ...unconfigured].map((id, i) => [id, i + 1]))
     setLocalEntries(allEntries.map(e => ({ ...e, priority: prio.get(e.modelDbId) ?? e.priority })))
+  }
+
+  // Jump-to-rank (#1317): type a target rank instead of dragging a model across
+  // a long chain. Same staging path as drag — persistGroupOrder serializes the
+  // new display order into localEntries and Save commits it. The typed rank is
+  // clamped to the chain, so 1 means "front of the queue" and an over-the-end
+  // number means "last" without needing a validation error.
+  function handleMoveGroupRank(key: string, toRank: number) {
+    const oldI = orderedGroups.findIndex(g => g.key === key)
+    if (oldI < 0) return
+    const newI = clampRankToIndex(toRank, orderedGroups.length)
+    if (newI === oldI) return
+    persistGroupOrder(arrayMove(orderedGroups, oldI, newI))
   }
 
   // Reorder models (the failover priority order). Providers within a model are
@@ -404,6 +435,28 @@ export default function FallbackPage() {
                 </Tooltip>
               </label>
 
+              {/* Cooldown ceiling (#952). Caps the router's OWN bench guesses
+                  (escalation ladder, 402/403 day benches); provider-stated
+                  retry times are never shortened. Shown in every mode: the
+                  ladder runs regardless of how models are ranked. */}
+              <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                <span>{t('strategies.cooldownCeiling')}</span>
+                <select
+                  value={routing?.cooldownCeilingMs == null ? '' : String(routing.cooldownCeilingMs)}
+                  disabled={strategyMutation.isPending}
+                  onChange={e => strategyMutation.mutate({ strategy, cooldownCeilingMs: e.target.value === '' ? null : Number(e.target.value) })}
+                  className="rounded-lg border bg-background px-2 py-1.5 text-xs text-foreground"
+                >
+                  <option value="">{t('strategies.cooldownCeilingDefault')}</option>
+                  <option value={String(10 * 60_000)}>{t('strategies.cooldownCeiling10m')}</option>
+                  <option value={String(60 * 60_000)}>{t('strategies.cooldownCeiling1h')}</option>
+                  <option value={String(6 * 60 * 60_000)}>{t('strategies.cooldownCeiling6h')}</option>
+                </select>
+                <Tooltip text={t('strategies.cooldownCeilingHint')}>
+                  <span className="cursor-help underline decoration-dotted underline-offset-2">?</span>
+                </Tooltip>
+              </label>
+
               {/* Exploration toggle (#685 follow-up): a niche knob that gives
                   unmeasured models a guaranteed chance to be tried so they build
                   reliability/speed data. Hidden in Manual mode, where
@@ -436,6 +489,12 @@ export default function FallbackPage() {
                   onSave={p => strategyMutation.mutate({ strategy, ...p })}
                 />
               )}
+
+              {/* Minimum reliability floor (#filter): independent of the strategy
+                  snapshot — lives in settings, so it owns its own query/mutation.
+                  Shown in every mode; the floor pre-filters the candidate chain
+                  regardless of how models are ranked. */}
+              <ReliabilityFloorControl />
             </div>
           )}
 
@@ -561,7 +620,7 @@ export default function FallbackPage() {
                     <SortableContext items={renderedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
                       <tbody>
                         {renderedGroups.map(g => (
-                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} editableRank onMoveRank={r => handleMoveGroupRank(g.key, r)} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                         ))}
                       </tbody>
                     </SortableContext>
@@ -577,7 +636,7 @@ export default function FallbackPage() {
                       <tr
                         key={g.key}
                         onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
-                        className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? '' : 'opacity-50'}`}
+                        className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? (isGroupDepleted(g.members, rateUsageByModel) ? 'opacity-60' : '') : 'opacity-50'}`}
                       >
                         <GroupHeaderCells group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                       </tr>

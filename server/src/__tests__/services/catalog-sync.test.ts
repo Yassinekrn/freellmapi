@@ -2,7 +2,12 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { initDb, getDb, setSetting, getSetting } from '../../db/index.js';
 import { applyCatalog, reapplyCachedCatalog, MIN_CATALOG_VERSION } from '../../services/catalog-sync.js';
 import { runMigrationsSync } from '../../db/migrate/runner.js';
-import { recordCatalogModelTombstone, upsertModelOverrides } from '../../services/model-state.js';
+import {
+  getCatalogModelTombstone,
+  recordCatalogModelTombstone,
+  retireCatalogModelUpstream,
+  upsertModelOverrides,
+} from '../../services/model-state.js';
 
 // applyCatalog is the write path between the published catalog and the live
 // router DB. These tests lock its contract: catalog metadata always wins, the
@@ -241,6 +246,42 @@ describe('applyCatalog', () => {
     expect(getDb().prepare("SELECT id FROM models WHERE platform = 'some-future-provider'").get()).toBeUndefined();
   });
 
+  it('imports the new chat providers and keeps Speechify exclusively in audio', () => {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({ platform: 'clod', modelId: 'test-clod' }));
+    models.push(baseModel({ platform: 'blaze', modelId: 'test-blaze' }));
+    models.push(baseModel({ platform: 'speechify', modelId: 'test-simba', modality: 'audio' }));
+    applyCatalog(getDb(), catalogOf(models));
+    for (const platform of ['clod', 'blaze']) {
+      expect(getDb().prepare('SELECT enabled FROM models WHERE platform = ?').get(platform)).toEqual({ enabled: 1 });
+    }
+    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'speechify'").get()).toBeUndefined();
+    expect(getDb().prepare("SELECT model_id, modality, enabled FROM media_models WHERE platform = 'speechify'").get()).toEqual({ model_id: 'test-simba', modality: 'audio', enabled: 1 });
+  });
+
+  it('imports Free.ai speech only from the catalog, never as a chat model or bundled seed', () => {
+    expect(getDb().prepare("SELECT id FROM media_models WHERE platform='freeai'").get()).toBeUndefined();
+    const catalog = catalogOf([...existingAsCatalogModels(), baseModel({ platform: 'freeai', modelId: 'kokoro', modality: 'audio' })]);
+    applyCatalog(getDb(), catalog);
+    applyCatalog(getDb(), catalog);
+    expect(getDb().prepare("SELECT id FROM models WHERE platform='freeai'").get()).toBeUndefined();
+    expect(getDb().prepare("SELECT model_id, modality, enabled FROM media_models WHERE platform='freeai'").all()).toEqual([{ model_id: 'kokoro', modality: 'audio', enabled: 1 }]);
+  });
+
+  it('adds Speka chat and embedding rows only when the signed catalog supplies them', () => {
+    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'speka'").get()).toBeUndefined();
+    expect(getDb().prepare("SELECT id FROM embedding_models WHERE platform = 'speka'").get()).toBeUndefined();
+    const catalog = catalogOf([...existingAsCatalogModels(), baseModel({ platform: 'speka', modelId: 'z-ai/glm-5.3' })]);
+    catalog.embeddings = [...existingAsCatalogEmbeddings(), {
+      family: 'nemotron-3-embed-1b-speka', platform: 'speka', modelId: 'nvidia/nemotron-3-embed-1b',
+      displayName: 'Nemotron 3 Embed 1B (Speka)', dimensions: 2048, maxInputTokens: 8192,
+      priority: 1, enabled: true, quotaLabel: '$1/month shared',
+    }];
+    applyCatalog(getDb(), catalog);
+    expect(getDb().prepare("SELECT enabled FROM models WHERE platform = 'speka'").get()).toEqual({ enabled: 1 });
+    expect(getDb().prepare("SELECT dimensions, enabled FROM embedding_models WHERE platform = 'speka'").get()).toEqual({ dimensions: 2048, enabled: 1 });
+  });
+
   it('applies the full embedding snapshot and retires a replaced provider id', () => {
     const embeddings = existingAsCatalogEmbeddings();
     const openRouter = embeddings.find(
@@ -351,6 +392,42 @@ describe('reapplyCachedCatalog', () => {
     expect(
       getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(victim.platform, victim.modelId),
     ).toBeUndefined();
+  });
+
+  it('keeps an upstream retirement across a cached re-apply, and lifts it only for a newer catalog', () => {
+    // The re-apply replays the snapshot the retirement already post-dates, so
+    // it must not read that snapshot as a newer opinion — otherwise every 410
+    // (#634) is undone by the next restart. A genuinely newer catalog still
+    // wins, which is what the lift exists for.
+    const models = existingAsCatalogModels();
+    models.push(baseModel({ modelId: 'replay-retired', displayName: 'Replay Retired' }));
+    const catalog = catalogOf(models);
+    applyCatalog(getDb(), catalog);
+    cacheCatalog(catalog);
+
+    const row = getDb()
+      .prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = 'replay-retired'")
+      .get() as { id: number };
+    expect(retireCatalogModelUpstream(getDb(), row.id, 'groq', 'replay-retired', 'HTTP 410 gone')).toBe(true);
+    const chainOff = () =>
+      (getDb().prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(row.id) as { enabled: number }).enabled;
+    expect(chainOff()).toBe(0);
+
+    expect(reapplyCachedCatalog().reapplied).toBe(true);
+    expect(getCatalogModelTombstone(getDb(), 'chat', 'groq', 'replay-retired')?.source).toBe('upstream_eol');
+    expect(chainOff()).toBe(0);
+    // Retirement disables the chain entries, never the row: the dashboard keeps
+    // showing it as retired upstream rather than losing it.
+    expect(
+      (getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(row.id) as { enabled: number }).enabled,
+    ).toBe(1);
+
+    // Same model, still listed enabled, but a catalog the install has not seen.
+    const newer = catalogOf(existingAsCatalogModels());
+    newer.version = '2099.02.02';
+    applyCatalog(getDb(), newer);
+    expect(getCatalogModelTombstone(getDb(), 'chat', 'groq', 'replay-retired')).toBeUndefined();
+    expect(chainOff()).toBe(1);
   });
 
   it('clears the applied version when an older install has no cached document', () => {

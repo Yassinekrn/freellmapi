@@ -37,6 +37,63 @@ describe('client agent classification', () => {
     expect(classifyClientAgent(request('/v1/chat/completions', {
       'user-agent': 'deepseek-harness/0.3.1 (+https://github.com/deepseek-ai/deepseek-harness)',
     }))).toBe('deepseek-harness');
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'atomcode/5.0.9',
+    }))).toBe('atomcode');
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'RooCode/3.50.4',
+    }))).toBe('roo');
+  });
+
+  it('recognizes OpenClaw by the static header its generated provider sends', () => {
+    // A custom provider in OpenClaw gets the bare openai-node UA, so the
+    // generator sets `headers: { User-Agent: 'openclaw' }`; the bare word and
+    // the `openclaw/<version>` form OpenClaw uses natively both count.
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'openclaw',
+    }))).toBe('openclaw');
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'openclaw/2026.9.4',
+    }))).toBe('openclaw');
+    // The unmodified SDK UA still files under openai-sdk, so a hand-written
+    // provider without the header is not misattributed.
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'OpenAI/JS 7.8.0',
+    }))).toBe('openai-sdk');
+  });
+
+  it('recognizes Hermes Agent by its header and its model-probe UA', () => {
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'hermes-agent',
+    }))).toBe('hermes-agent');
+    expect(classifyClientAgent(request('/v1/models', {
+      'user-agent': 'hermes-cli/0.21.3',
+    }))).toBe('hermes-agent');
+  });
+
+  it('recognizes Pi by its header and its native UA without catching other `pi` substrings', () => {
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'pi-coding-agent',
+    }))).toBe('pi');
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'pi/0.99.2 (darwin; node/v24.4.0; arm64)',
+    }))).toBe('pi');
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'OpenAI/JS 6.10.0',
+    }))).toBe('openai-sdk');
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'my-api-client/1.0',
+    }))).not.toBe('pi');
+  });
+
+  it('recognizes Reasonix by the UA it sends to every endpoint', () => {
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'Reasonix/2.29.0',
+    }))).toBe('reasonix');
+    // Its web_fetch tool is not a model request from the agent loop.
+    expect(classifyClientAgent(request('/v1/chat/completions', {
+      'user-agent': 'reasonix-web-fetch/1.0',
+    }))).not.toBe('reasonix');
   });
 
   it('separates MiMo Code from the OpenCode it derives from', () => {

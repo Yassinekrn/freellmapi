@@ -204,6 +204,10 @@ export interface PlatformParamPolicy {
   // are 'text' and 'json_schema'."). Upgrade json_object to a permissive
   // json_schema on the wire instead of dropping structured output entirely.
   jsonObjectToSchema?: boolean;
+  // The reverse compatibility shim for providers that support JSON mode but
+  // not schema enforcement. Preserve structured output by requesting a JSON
+  // object instead of sending an unsupported json_schema payload.
+  jsonSchemaToObject?: boolean;
   // The effort values this platform's API accepts, when it accepts fewer than
   // the full scale. A request outside the set is clamped to the nearest
   // supported value instead of being forwarded into a 400 (#619). Omitted =
@@ -238,6 +242,29 @@ export const GITHUB_MAX_OUTPUT_TOKENS = 400;
 // silently no-op'ing the policy; the string-typed accessors below cast at the
 // boundary since routes carry platform ids as plain strings.
 export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPolicy>> = {
+  // Inferbase Free managed inference rejects output budgets above 1,024.
+  // Match the documented upstream ceiling, not a new application quota.
+  inferbase: { defaultMaxTokens: 1024, maxTokensCap: 1024 },
+  // Gizmo rejects all unlisted fields; reflect its text-only API in discovery
+  // as well as the adapter. This is the upstream ceiling, not a new quota.
+  gizmo: { drop: [...EXTENDED_SAMPLING_KEYS], defaultMaxTokens: 1024, maxTokensCap: 32768 },
+  // Moondream maps reasoning effort to a boolean and max_tokens to
+  // max_completion_tokens. 4096 is the documented upstream output ceiling.
+  moondream: {
+    drop: ['top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'response_format'],
+    maxTokensCap: 4096,
+  },
+  // ACLIDE uses Responses; these Chat Completions parameters have no mapping.
+  aclide: {
+    drop: ['top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'],
+  },
+  // Sail's stable Responses API accepts temperature/top_p, JSON Schema output,
+  // tools and reasoning effort. The remaining Chat Completions knobs are not
+  // supported and are intentionally omitted by the dedicated adapter.
+  sail: {
+    drop: ['top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'],
+    jsonObjectToSchema: true,
+  },
   // Mistral's API is strict (422 on unknown body keys) and names its seed
   // `random_seed`. It has no top_k/min_p/logit_bias/logprobs equivalents, and
   // no reasoning_effort (Magistral's reasoning has no request-side knob).
@@ -280,6 +307,14 @@ export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPoli
     drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'],
     defaultMaxTokens: 8192,
   },
+  // Radeon Cloud silently drops these fields. Keep reasoning_effort within the
+  // common subset of its current shared roster (Qwen: low/medium; DeepSeek is
+  // broader) so either model receives a supported value.
+  radeon: {
+    drop: ['top_k', 'min_p', 'seed', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'],
+    reasoningEfforts: ['low', 'medium'],
+    jsonSchemaToObject: true,
+  },
   // AI Horde builds its own payload format; none of the extended set maps.
   aihorde: { drop: [...EXTENDED_SAMPLING_KEYS] },
   // Kilo's anonymous gateway 400s ("Provider returned error") whenever
@@ -319,6 +354,10 @@ export function extendedBodyParams(platform: string, options: ExtendedSamplingOp
         && (value as { type?: string }).type === 'json_object') {
       value = ANY_OBJECT_SCHEMA;
     }
+    if (key === 'response_format' && policy?.jsonSchemaToObject
+        && (value as { type?: string }).type === 'json_schema') {
+      value = { type: 'json_object' };
+    }
     if (key === 'reasoning_effort' && policy?.reasoningEfforts) {
       value = clampEffortTo(value as ReasoningEffort, policy.reasoningEfforts);
       if (value === undefined) continue;
@@ -353,13 +392,13 @@ export function maxTokensCapFor(platform: string): number | undefined {
  * openai-compat (and its subclasses), cloudflare, cohere, google and aihorde
  * all do.
  */
-export function resolveMaxTokens(platform: string, requested: number | undefined): number | undefined {
+export function resolveMaxTokens(platform: string, requested: number | undefined, contextBudget?: number): number | undefined {
   const resolved = requested ?? defaultMaxTokensFor(platform);
   if (resolved == null) return resolved;
   // The tighter ceiling wins: a platform's hard reject applies even with the
   // operator cap off, and an operator cap below it applies everywhere.
-  const caps = [unifiedMaxTokensCap(), maxTokensCapFor(platform)].filter((c): c is number => c != null);
-  return caps.length === 0 ? resolved : Math.min(resolved, ...caps);
+  const caps = [unifiedMaxTokensCap(), maxTokensCapFor(platform), contextBudget].filter((c): c is number => c != null && c > 0);
+  return caps.length === 0 ? resolved : Math.max(1, Math.min(resolved, ...caps));
 }
 
 // ── Unified output-token cap ─────────────────────────────────────────────────
@@ -407,6 +446,8 @@ export function platformDropsResponseFormat(platform: string): boolean {
  *  every surface supports, plus tools when the model does, minus the
  *  platform's droplist. */
 export function supportedParametersFor(platform: string, caps: { tools?: boolean } = {}): string[] {
+  // Unlike the generic base set, Moondream has neither stop nor tools.
+  if (platform === 'moondream') return ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'stream', 'reasoning_effort'];
   const policy = PLATFORM_PARAM_POLICIES[platform as Platform];
   const dropped = new Set<string>(policy?.drop ?? []);
   const params = [

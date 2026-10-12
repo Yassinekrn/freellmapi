@@ -32,6 +32,7 @@ import { geminiRouter } from './routes/gemini.js';
 import { ollamaRouter } from './routes/ollama.js';
 import { urlTokenRouter } from './routes/url-tokens.js';
 import { updateRouter } from './routes/update.js';
+import { moderationRouter } from './routes/moderation.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter, createAdminRateLimiter } from './middleware/rateLimit.js';
 
@@ -96,6 +97,12 @@ function isTrustworthyOrigin(req: express.Request): boolean {
 export function createApp(config?: Config) {
   const cfg = config ?? loadConfig();
   const app = express();
+  // TRUST_PROXY (#1024): opt-in trust of X-Forwarded-* from a reverse proxy.
+  // false (default) ignores forwarded headers so direct callers cannot spoof
+  // the client IP; true trusts every hop; a comma-separated list of addresses
+  // /CIDRs trusts only those proxies. Must be set before client-context and
+  // the rate-limit middleware, which both resolve the client IP.
+  app.set('trust proxy', cfg.trustProxy);
   const allowedCorsOrigins = new Set([
     ...DEFAULT_DASHBOARD_ORIGINS,
     ...cfg.dashboardOrigins,
@@ -209,17 +216,24 @@ export function createApp(config?: Config) {
   );
   app.use(ollamaRouter);
 
-  // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
-  // session; everything else under /api/* requires a logged-in dashboard user.
-  // The /v1 proxy keeps its own unified-API-key auth and is NOT gated here.
-  app.use('/api/auth', authRouter);
-
   // Admin API — all routes share an IP-based rate limiter to throttle
   // brute-force attempts (auth, key export, etc). The limiter is mounted
   // broadly on /api; requireAuth gates each sub-path individually so that
   // unauthenticated endpoints under /api (like /api/ping) are not blocked.
+  //
+  // This MUST stay above the /api/auth mount below. Express runs middleware in
+  // registration order, so while the limiter was registered after authRouter,
+  // authRouter answered and ended /api/auth/login before the limiter was ever
+  // entered — leaving the password endpoint this comment names as the reason
+  // for the limiter as the one /api path it did not cover. It still sits below
+  // the Ollama /api/* mount above, which carries its own proxy limiter.
   const adminRateLimiter = createAdminRateLimiter();
   app.use('/api', adminRateLimiter);
+
+  // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
+  // session; everything else under /api/* requires a logged-in dashboard user.
+  // The /v1 proxy keeps its own unified-API-key auth and is NOT gated here.
+  app.use('/api/auth', authRouter);
 
   // Key export re-verifies the dashboard password, which makes it the one admin
   // endpoint a guesser can attack. The broad limiter above is sized for normal
@@ -289,6 +303,8 @@ export function createApp(config?: Config) {
   // paths it doesn't own fall through to the OpenAI router untouched.
   app.use('/v1', anthropicRouter);
   app.use('/v1', proxyRouter);
+  // OpenAI Moderation API shim (POST /v1/moderations)
+  app.use('/v1', moderationRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
 

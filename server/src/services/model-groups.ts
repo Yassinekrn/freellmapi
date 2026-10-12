@@ -18,6 +18,7 @@ import { getDb, getSetting, setSetting } from '../db/index.js';
 import {
   ENDPOINT_ID_SEPARATOR,
   endpointRefMatches,
+  groupRefMatches,
   qualifiedModelMemberId,
 } from '../lib/endpoint-scope.js';
 
@@ -56,6 +57,9 @@ export interface GroupableRow {
   // Which custom endpoint this row belongs to; '' (or absent) for every catalog
   // platform and for legacy un-scoped custom rows (#651).
   endpoint_scope?: string;
+  // The operator's group label for that endpoint (#1176); null/absent when the
+  // endpoint is in the plain "Custom" group or the row is not a custom one.
+  endpoint_group?: string | null;
 }
 
 /**
@@ -166,13 +170,6 @@ export function qualifiedMemberId(row: GroupableRow): string | null {
   return qualifiedModelMemberId(row.platform, row.model_id, row.endpoint_scope);
 }
 
-// The grouping token for a row, after applying overrides. Split wins first
-// (forces a singleton/explicit key); then a merge redirects to its target;
-// otherwise the normalized display name.
-function tokenForRow(row: GroupableRow, ov: UnifyOverrides): string {
-  return tokenSourceForRow(row, ov).token;
-}
-
 /** The grouping token plus whether an operator override chose it. */
 function tokenSourceForRow(row: GroupableRow, ov: UnifyOverrides): { token: string; userDefined: boolean } {
   const mid = memberId(row);
@@ -251,7 +248,11 @@ export function groupRows(rows: GroupableRow[], ov: UnifyOverrides): ModelGroup[
  * The ladder, most specific first:
  *   1. "custom:model_id#endpoint" → exactly that relay's copy (#651) — the only
  *      form that can separate two endpoints offering the same model id. The
- *      endpoint part accepts the short handle or the endpoint URL itself;
+ *      endpoint part accepts the short handle or the endpoint URL itself.
+ *      It may also name an endpoint GROUP (#1176): "custom:model_id#my-relays"
+ *      (or the bare "model_id#my-relays") → every copy of that model on the
+ *      group's endpoints, so the router fails over inside the group only. An
+ *      endpoint match wins over a group of the same name;
  *   2. "platform:model_id" → that platform's copies. Normally exactly one row,
  *      so this is unchanged (#580: naming the platform means "this provider's
  *      copy", no failover to the rest of the group). Two relays sharing a model
@@ -281,6 +282,13 @@ export function resolveRequestedIdToTieredMembers(requested: string, groups: Mod
           return [{ modelDbId: m.model_db_id, tier: 'literal' }];
         }
       }
+    }
+    const inGroup = groups.flatMap(g => g.members.filter(m =>
+      m.platform === 'custom'
+      && (memberId(m) === base || m.model_id === base)
+      && groupRefMatches(endpointRef, m.endpoint_group)));
+    if (inGroup.length > 0) {
+      return inGroup.map(m => ({ modelDbId: m.model_db_id, tier: 'literal' as MatchTier }));
     }
   }
 
@@ -360,6 +368,15 @@ export function resolveRequestedIdForDispatch(
 }
 
 // ── DB convenience ───────────────────────────────────────────────────────────
+
+// #1047: GET /api/fallback calls this on every request, and grouping the whole
+// catalog (regex + canonical-id assignment over hundreds of rows) dominated the
+// handler once the chain read went catalog-wide (#1023). The SELECT itself is a
+// cheap pk scan, so run it every time and memoize only the expensive grouping,
+// keyed on a fingerprint of the exact inputs — any row change, in place or not,
+// and any override change recomputes, so this can never serve stale groups.
+let groupsCache: { fingerprint: string; groups: ModelGroup[] } | null = null;
+
 /**
  * Group the whole catalog (enabled + disabled rows so availability can be shown
  * and resolution is complete), applying the persisted overrides.
@@ -368,9 +385,22 @@ export function getModelGroups(): ModelGroup[] {
   const db = getDb();
   const rows = db.prepare(`
     SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.intelligence_rank,
-           m.endpoint_scope
+           m.endpoint_scope,
+           (SELECT k.group_label FROM api_keys k
+             WHERE m.platform = 'custom' AND m.endpoint_scope != ''
+               AND k.platform = 'custom' AND rtrim(k.base_url, '/') = m.endpoint_scope
+               AND k.group_label IS NOT NULL
+             ORDER BY k.id LIMIT 1) AS endpoint_group
     FROM models m
     ORDER BY m.id
   `).all() as GroupableRow[];
-  return groupRows(rows, getUnifyOverrides());
+  const overrides = getUnifyOverrides();
+  let fingerprint = JSON.stringify(overrides);
+  for (const r of rows) {
+    fingerprint += ` ${r.model_db_id}${r.platform}${r.model_id}${r.display_name}${r.intelligence_rank}${r.endpoint_scope ?? ''}${r.endpoint_group ?? ''}`;
+  }
+  if (groupsCache?.fingerprint === fingerprint) return groupsCache.groups;
+  const groups = groupRows(rows, overrides);
+  groupsCache = { fingerprint, groups };
+  return groups;
 }

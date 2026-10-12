@@ -22,14 +22,40 @@ export function GetKeyLink({ url }: { url: string }) {
 // `url` points to each provider's key-management / signup page so the Keys page
 // can show a "Get API key" shortcut (#137). OpenCode Zen's key is free from
 // opencode.ai/auth — no card needed; billing only applies to paid models (#128).
-// `keyless: true` providers (Kilo's anonymous free tier) need no API key — the
-// form disables the key field and submits a sentinel the backend stores so
-// routing treats the platform as configured.
+// `keyless: true` providers (Kilo, OVH, AI Horde) need no API key but accept
+// one (#1331): the key field is optional, a blank submit stores a sentinel so
+// routing treats the platform as configured and calls go out anonymously, and
+// a real key is stored and sent like any other.
 export const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolean }[] = [
+  { value: 'aclide', label: 'ACLIDE (shared monthly credits)', url: 'https://aclide.com/en/dashboard/api-keys' },
+  { value: 'speka', label: 'Speka ($1 shared monthly credits)', url: 'https://speka.me/dashboard/keys' },
+  { value: 'typhoon', label: 'Typhoon (free research API)', url: 'https://playground.opentyphoon.ai' },
+  { value: 'plugsky', label: 'Plugsky (free chat aliases)', url: 'https://plugsky.com/dashboard' },
+  { value: 'inferbase', label: 'Inferbase (shared monthly and daily allowance)', url: 'https://inferbase.ai' },
+  { value: 'simplellm', label: 'SimpleLLM (shared hourly and daily free quota)', url: 'https://app.simplellm.eu' },
+  { value: 'llmtr', label: 'LLMTR (daily free-model quotas)', url: 'https://llmtr.com' },
+  { value: 'gizmo', label: 'Gizmo (monthly free-model requests)', url: 'https://gizmoplatforms.com/developers' },
+  { value: 'blockrun', label: 'BlockRun (zero-priced models)', url: 'https://user.blockrun.ai/dashboard/keys' },
+  { value: 'moondream', label: 'Moondream ($5 shared monthly credits)', url: 'https://moondream.ai/c/cloud/api-keys' },
   { value: 'google', label: 'Google AI Studio', url: 'https://aistudio.google.com/apikey' },
   { value: 'groq', label: 'Groq', url: 'https://console.groq.com/keys' },
   { value: 'cerebras', label: 'Cerebras', url: 'https://cloud.cerebras.ai' },
+  { value: 'sail', label: 'Sail Research ($5 monthly with payment method)', url: 'https://app.sailresearch.com' },
+  { value: 'electronhub', label: 'ElectronHub (shared weekly credits)', url: 'https://app.electronhub.ai' },
+  { value: 'experiential', label: 'Experiential Labs (shared monthly credits)', url: 'https://platform.experientiallabs.ai' },
+  { value: 'router9', label: 'Router9 (shared monthly credits)', url: 'https://www.router9.com' },
+  { value: 'septor', label: 'Septor Labs (daily free-model quota)', url: 'https://septorlabs.com/dashboard' },
+  { value: 'clod', label: 'CLōD (shared daily free requests)', url: 'https://newapp.clod.io' },
+  { value: 'speechify', label: 'Speechify (monthly free TTS characters)', url: 'https://platform.speechify.ai' },
+  { value: 'freeai', label: 'Free.ai (shared daily free TTS tokens)', url: 'https://free.ai/account/#api-keys' },
+  { value: 'blaze', label: 'BlazeAPI (daily free tokens; Discord verification)', url: 'https://blazeapi.org/dashboard' },
+  { value: 'lucidity', label: 'Lucidity Composite (daily free-model requests)', url: 'https://composite.lucidity.sh' },
+  { value: 'airforce', label: 'Api.Airforce (daily free requests; 1 per minute)', url: 'https://api.airforce' },
+  { value: 'dreamprompting', label: 'DreamPrompting (rolling 24h free tokens and requests)', url: 'https://dreamprompting.com' },
+  { value: 'waterfall', label: 'Waterfall (community free models)', url: 'https://getwaterfall.org' },
+  { value: 'logfare', label: 'Logfare (fair-use free models)', url: 'https://logfare.ai' },
   { value: 'bai', label: 'B.AI (promotional free model)', url: 'https://b.ai' },
+  { value: 'radeon', label: 'AMD Radeon Cloud (free shared models)', url: 'https://developer.amd.com.cn/radeon/tokenfactory' },
   { value: 'nvidia', label: 'NVIDIA NIM', url: 'https://build.nvidia.com/settings/api-keys' },
   { value: 'mistral', label: 'Mistral', url: 'https://console.mistral.ai/api-keys/' },
   { value: 'openrouter', label: 'OpenRouter', url: 'https://openrouter.ai/keys' },
@@ -43,9 +69,9 @@ export const PLATFORMS: { value: Platform; label: string; url: string; keyless?:
   { value: 'ovh', label: 'OVH AI Endpoints (no key needed)', url: 'https://endpoints.ai.cloud.ovh.net', keyless: true },
   { value: 'llm7', label: 'LLM7 (anon ok)', url: 'https://llm7.io' },
   { value: 'huggingface', label: 'HuggingFace Router', url: 'https://huggingface.co/settings/tokens' },
-  { value: 'opencode', label: 'OpenCode Zen (free key)', url: 'https://opencode.ai/auth' },
+  { value: 'opencode', label: 'OpenCode Zen (paid models only)', url: 'https://opencode.ai/auth' },
   { value: 'agnes', label: 'Agnes AI (free key)', url: 'https://platform.agnes-ai.com' },
-  { value: 'reka', label: 'Reka (free key)', url: 'https://platform.reka.ai' },
+  { value: 'reka', label: 'Reka (prepaid credits)', url: 'https://platform.reka.ai' },
   { value: 'siliconflow', label: 'SiliconFlow (image + TTS)', url: 'https://siliconflow.com' },
   { value: 'elevenlabs', label: 'ElevenLabs (TTS only)', url: 'https://elevenlabs.io/app/settings/api-keys' },
   { value: 'routeway', label: 'Routeway (free key)', url: 'https://routeway.ai' },

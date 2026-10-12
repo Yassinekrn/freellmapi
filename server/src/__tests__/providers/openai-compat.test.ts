@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { OpenAICompatProvider } from '../../providers/openai-compat.js';
+import dns from 'node:dns';
+import { OpenAICompatProvider, inBandCreditsError } from '../../providers/openai-compat.js';
 
 describe('OpenAICompatProvider', () => {
   let provider: OpenAICompatProvider;
@@ -67,6 +68,91 @@ describe('OpenAICompatProvider', () => {
     expect(capturedHeaders['Authorization']).toBe('Bearer my-key');
     expect(capturedHeaders['X-Custom']).toBe('test');
     expect(capturedBody.messages[0].role).toBe('user');
+  });
+
+  describe('Moonshot assistant `partial` prefill flag (#1038)', () => {
+    beforeEach(() => {
+      // The custom-platform SSRF guard resolves public hosts before every
+      // request; answer with a public address so no real DNS is needed.
+      vi.spyOn(dns.promises, 'lookup').mockResolvedValue([{ address: '203.0.113.10', family: 4 }] as any);
+    });
+    function captureBody(): { body: () => any } {
+      let captured: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        captured = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'test-id',
+            object: 'chat.completion',
+            created: 123,
+            model: 'test-model',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        } as any;
+      });
+      return { body: () => captured };
+    }
+    const prefill: any = { role: 'assistant', content: 'continue this', partial: true };
+    const custom = (baseUrl: string) => new OpenAICompatProvider({ platform: 'custom', name: 'Custom', baseUrl });
+
+    it('forwards `partial` to a custom endpoint on a Moonshot host', async () => {
+      const captured = captureBody();
+      await custom('https://api.moonshot.ai/v1').chatCompletion('k', [prefill], 'kimi-k2-0905-preview');
+      expect(captured.body().messages[0].partial).toBe(true);
+
+      await custom('https://api.moonshot.cn/v1').chatCompletion('k', [prefill], 'moonshot-v1-8k');
+      expect(captured.body().messages[0].partial).toBe(true);
+
+      await custom('https://api.kimi.com/coding/v1').chatCompletion('k', [prefill], 'kimi-for-coding');
+      expect(captured.body().messages[0].partial).toBe(true);
+    });
+
+    it('strips `partial` for a custom endpoint on any other host, even for a Kimi model id', async () => {
+      const captured = captureBody();
+      await custom('http://127.0.0.1:11434/v1').chatCompletion('k', [prefill], 'kimi-k2:1t-cloud');
+      expect(captured.body().messages[0]).not.toHaveProperty('partial');
+      expect(captured.body().messages[0].content).toBe('continue this');
+
+      // A look-alike host is not Moonshot.
+      await custom('https://moonshot.ai.example.com/v1').chatCompletion('k', [prefill], 'kimi-latest');
+      expect(captured.body().messages[0]).not.toHaveProperty('partial');
+    });
+
+    it('strips `partial` on Groq even when the model id is a Kimi model', async () => {
+      const captured = captureBody();
+      const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+      await groq.chatCompletion('k', [prefill], 'moonshotai/kimi-k2-instruct-0905');
+      expect(captured.body().messages[0]).not.toHaveProperty('partial');
+      expect(captured.body().messages[0].content).toBe('continue this');
+    });
+
+    it('strips `partial` on a non-strict built-in gateway that serves Kimi models', async () => {
+      const captured = captureBody();
+      const openrouter = new OpenAICompatProvider({ platform: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' });
+      await openrouter.chatCompletion('k', [
+        { role: 'user', content: 'hi' },
+        { ...prefill, reasoning_content: 'kept: only partial is Moonshot-private' },
+      ], 'moonshotai/kimi-k2:free');
+      const msgs = captured.body().messages;
+      expect(msgs[1]).not.toHaveProperty('partial');
+      expect(msgs[1].reasoning_content).toBe('kept: only partial is Moonshot-private');
+      expect(msgs[0]).toEqual({ role: 'user', content: 'hi' });
+    });
+
+    it('also strips `partial` on the streaming path for non-Moonshot endpoints', async () => {
+      let captured: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        captured = JSON.parse((init as any).body);
+        return sseResponse(['data: [DONE]\n\n']);
+      });
+      await collect(custom('http://127.0.0.1:1234/v1').streamChatCompletion('k', [prefill], 'kimi-latest'));
+      expect(captured.messages[0]).not.toHaveProperty('partial');
+
+      await collect(custom('https://api.moonshot.ai/v1').streamChatCompletion('k', [prefill], 'kimi-latest'));
+      expect(captured.messages[0].partial).toBe(true);
+    });
   });
 
   it('uses a 60s chat timeout by default for OpenAI-compatible providers (#530)', async () => {
@@ -413,6 +499,68 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
+  it('strips assistant reasoning_content before sending messages to Groq (#1070)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    await groq.chatCompletion(
+      'k',
+      [{
+        role: 'assistant',
+        content: 'replayed turn',
+        reasoning_content: 'private chain from a prior thinking turn',
+      }],
+      'llama-3.3-70b-versatile',
+    );
+
+    // Groq is strict about unknown fields: reasoning_content must NOT reach the wire.
+    expect(body.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(body.messages[0]).toEqual({ role: 'assistant', content: 'replayed turn' });
+  });
+
+  it('strips assistant reasoning_content before sending messages to Cerebras (#1070)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+
+    const cerebras = new OpenAICompatProvider({ platform: 'cerebras', name: 'Cerebras', baseUrl: 'https://api.cerebras.ai/v1' });
+    await cerebras.chatCompletion(
+      'k',
+      [{
+        role: 'assistant',
+        content: 'replayed turn',
+        reasoning_content: 'private chain from a prior thinking turn',
+      }],
+      'zai-glm-4.7',
+    );
+
+    // Cerebras is strict about unknown fields: reasoning_content must NOT reach
+    // the wire (verified: 400 wrong_api_format 'property ... reasoning_content
+    // is unsupported', see vercel/ai#15042 / opencode#26762).
+    expect(body.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(body.messages[0]).toEqual({ role: 'assistant', content: 'replayed turn' });
+  });
+
   it('folds reasoning into content when content is empty (Ollama style — bare `reasoning` field)', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: true,
@@ -500,6 +648,7 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'cerebras',   name: 'Cerebras',      baseUrl: 'https://api.cerebras.ai/v1' },
     { platform: 'bai',        name: 'B.AI',          baseUrl: 'https://api.b.ai/v1' },
     { platform: 'anyapi',     name: 'AnyAPI',        baseUrl: 'https://api.anyapi.ai/v1' },
+    { platform: 'radeon',     name: 'AMD Radeon Cloud', baseUrl: 'https://developer.amd.com.cn/radeon/api/v1' },
     { platform: 'nvidia',     name: 'NVIDIA NIM',    baseUrl: 'https://integrate.api.nvidia.com/v1' },
     { platform: 'mistral',    name: 'Mistral',       baseUrl: 'https://api.mistral.ai/v1' },
     { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
@@ -888,5 +1037,96 @@ describe('reasoning: request knob + <think> extraction (P2 #16)', () => {
     expect(chunks).toHaveLength(4);
     expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
     expect(chunks.some(c => (c.choices?.[0]?.delta as any)?.reasoning_content != null)).toBe(false);
+  });
+});
+
+describe('OpenAICompatProvider in-band out-of-credits notice (#pollinations-inband)', () => {
+  // The canned Pollinations top-up message returned as a 200 body.
+  const CREDITS = "The account behind this API key doesn't have enough credits. " +
+    'Please top up (https://enter.pollinations.ai/top-up?ref=agent_low_balance_topup) or ' +
+    'complete a quest (https://enter.pollinations.ai/quests?ref=agent_low_balance_quests), then try again.';
+
+  afterEach(() => vi.restoreAllMocks());
+
+  const provider = () => new OpenAICompatProvider({ platform: 'groq', name: 'Pollinations', baseUrl: 'https://x/v1' });
+
+  function sse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+  const dataFrame = (delta: Record<string, unknown>, finish: string | null = null) =>
+    `data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+  async function collect<T>(g: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const c of g) out.push(c);
+    return out;
+  }
+
+  describe('inBandCreditsError', () => {
+    it('flags the Pollinations notice and a truncated prefix of it', () => {
+      expect(inBandCreditsError(CREDITS)).toBeTruthy();
+      expect(inBandCreditsError("doesn't have enough credits. Please top up")).toBeTruthy();
+    });
+    it('does not flag a genuine reply that merely mentions credits', () => {
+      expect(inBandCreditsError("You don't need enough credits upfront — just enable billing.")).toBeNull();
+      expect(inBandCreditsError('Here is a poem about the ocean.')).toBeNull();
+      expect(inBandCreditsError('')).toBeNull();
+      expect(inBandCreditsError(undefined)).toBeNull();
+    });
+  });
+
+  it('non-stream: throws a payment-required error instead of returning the notice', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      headers: new Headers(),
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: CREDITS }, finish_reason: 'stop' }],
+      }),
+    }) as any);
+    await expect(provider().chatCompletion('k', [{ role: 'user', content: 'q' }], 'm'))
+      .rejects.toThrow(/402|insufficient credit/i);
+  });
+
+  it('non-stream: a normal reply is returned unchanged', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      headers: new Headers(),
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello there' }, finish_reason: 'stop' }],
+      }),
+    }) as any);
+    const res = await provider().chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    expect(res.choices[0].message.content).toBe('hello there');
+  });
+
+  it('stream: throws before yielding any chunk when the body is a credits notice', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: CREDITS }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    await expect(collect(provider().streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm')))
+      .rejects.toThrow(/402|insufficient credit/i);
+  });
+
+  it('stream: a normal reply passes through unchanged', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: 'Hello ' }),
+      dataFrame({ content: 'world' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const chunks = await collect(provider().streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
   });
 });

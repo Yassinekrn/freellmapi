@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Check, ChevronDown, Layers, Plus, Trash2 } from 'lucide-react'
+import { Check, ChevronDown, Layers, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useI18n } from '@/i18n'
 import { apiFetch, type ApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -52,6 +52,13 @@ export function ChainManager() {
   const [startEmpty, setStartEmpty] = useState(true)
   const [createError, setCreateError] = useState('')
   const [collapsed, setCollapsed] = useState<boolean>(readCollapsed)
+  // Inline rename (#1179): one row is editable at a time, like the Playground
+  // conversation list. Renaming is safe mid-flight — routing resolves the name
+  // at request time — but in-flight auto:<old-name> requests fail, so the
+  // confirm step says so.
+  const [renamingId, setRenamingId] = useState<number | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [renameError, setRenameError] = useState('')
 
   const { data: chains = [] } = useQuery<Chain[]>({
     queryKey: ['profiles'],
@@ -62,12 +69,16 @@ export function ChainManager() {
     queryFn: () => apiFetch('/api/profiles/active'),
   })
 
-  const invalidate = () => {
+  const invalidate = async () => {
+    // Resolve WHICH chain is active before refreshing anything keyed on it
+    // (#1047): invalidating ['fallback'] first refetched the chain table under
+    // the old profile id — a wasted full-catalog round trip, and the write that
+    // poisoned the old chain's cache entry with the new chain's rows.
+    await queryClient.refetchQueries({ queryKey: ['profiles', 'active'], exact: true })
     queryClient.invalidateQueries({ queryKey: ['profiles'] })
-    queryClient.invalidateQueries({ queryKey: ['profiles', 'active'] })
-    // The fallback table renders the active chain; refresh it too.
+    // The fallback table renders the active chain; refresh it too. The prefix
+    // covers the chain, routing, token-usage and rate-limit queries.
     queryClient.invalidateQueries({ queryKey: ['fallback'] })
-    queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] })
   }
 
   const createChain = useMutation({
@@ -92,6 +103,18 @@ export function ChainManager() {
     mutationFn: (profileId: number) =>
       apiFetch(`/api/profiles/${profileId}`, { method: 'DELETE' }),
     onSuccess: invalidate,
+  })
+  const renameChain = useMutation({
+    mutationFn: ({ profileId, name }: { profileId: number; name: string }) =>
+      apiFetch(`/api/profiles/${profileId}`, { method: 'PUT', body: JSON.stringify({ name }) }),
+    onSuccess: () => {
+      invalidate()
+      setRenamingId(null)
+      setRenameError('')
+    },
+    // Same server rules as create (charset, length, reserved, taken); show
+    // which one fired instead of leaving the row stuck in edit mode.
+    onError: (error: ApiError) => setRenameError(error.message || t('chains.renameFailed')),
   })
 
   if (chains.length === 0) return null
@@ -136,6 +159,43 @@ export function ChainManager() {
             {chains.map(chain => {
               const isActive = chain.id === activeId
               const isProtected = chain.type === 'default' || chain.type === 'builtin'
+              const isRenaming = renamingId === chain.id
+              if (isRenaming) {
+                return (
+                  <form
+                    key={chain.id}
+                    className="flex items-center gap-2 rounded-xl border border-foreground/25 bg-muted/50 px-3 py-2"
+                    onSubmit={e => {
+                      e.preventDefault()
+                      const name = renameDraft.trim()
+                      if (!name || renameChain.isPending) return
+                      if (name !== chain.name
+                        && !window.confirm(t('chains.renameConfirm', { oldName: chain.name, name }))) return
+                      renameChain.mutate({ profileId: chain.id, name })
+                    }}
+                  >
+                    <Input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={e => {
+                        setRenameDraft(e.target.value)
+                        setRenameError('')
+                      }}
+                      onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setRenamingId(null); setRenameError('') } }}
+                      aria-label={t('chains.renamePlaceholder')}
+                      placeholder={t('chains.renamePlaceholder')}
+                      className="h-7 max-w-48 text-sm"
+                    />
+                    <Button type="submit" size="sm" variant="secondary" className="h-7 px-2 text-xs" disabled={!renameDraft.trim() || renameChain.isPending}>
+                      {t('common.save')}
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => { setRenamingId(null); setRenameError('') }}>
+                      {t('common.cancel')}
+                    </Button>
+                    {renameError && <span className="text-xs text-rose-600 dark:text-rose-400">{renameError}</span>}
+                  </form>
+                )
+              }
               return (
                 <div
                   key={chain.id}
@@ -178,6 +238,24 @@ export function ChainManager() {
                         onClick={() => setActive.mutate(chain.id)}
                       >
                         {t('chains.activate')}
+                      </Button>
+                    </Tooltip>
+                  )}
+                  {!isProtected && (
+                    <Tooltip text={t('chains.renameHint')}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs text-muted-foreground"
+                        aria-label={t('chains.renameHint')}
+                        disabled={renameChain.isPending}
+                        onClick={() => {
+                          setRenamingId(chain.id)
+                          setRenameDraft(chain.name)
+                          setRenameError('')
+                        }}
+                      >
+                        <Pencil className="size-3.5" />
                       </Button>
                     </Tooltip>
                   )}

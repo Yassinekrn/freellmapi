@@ -42,6 +42,11 @@ const analyticsIds: Record<string, string> = {
   crush: 'crush',
   dsh: 'deepseek-harness',
   mimo: 'mimo-code',
+  atomcode: 'atomcode',
+  openclaw: 'openclaw',
+  hermes: 'hermes-agent',
+  pi: 'pi',
+  reasonix: 'reasonix',
   cursor: 'cursor',
 }
 

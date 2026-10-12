@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -17,11 +17,13 @@ import {
   DropdownMenuItem,
   DropdownMenuCheckboxItem,
 } from '@/components/ui/dropdown-menu'
-import { ChevronDown, CircleAlert, Copy, ExternalLink, KeyRound, ListFilter, ListPlus, MoreHorizontal, Pencil, Plus, RefreshCw, Search, Trash2, Zap } from 'lucide-react'
+import { ChevronDown, CircleAlert, Copy, ExternalLink, FlaskConical, KeyRound, Layers, ListFilter, ListPlus, MoreHorizontal, Pencil, Plus, RefreshCw, Search, Sparkles, Trash2, Zap } from 'lucide-react'
 import type { ApiKey, ApiKeyModel } from '../../../../shared/types'
 import { formatSqliteUtcToLocalTime } from '@/lib/utils'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
+import { keyMatchesQuery } from '@/lib/key-search'
+import { copyText } from '@/lib/clipboard'
 import {
   PLATFORMS,
   CUSTOM_GROUP,
@@ -31,26 +33,52 @@ import {
   statusDot,
   statusLabelKey,
 } from './shared'
+import { balanceByKey } from './quota-balance'
 import type { HealthData } from './shared'
 import { DiscoverModelsDialog } from './discover-models-dialog'
 import { AddEndpointKeyDialog } from './add-endpoint-key-dialog'
 import { CopyKeyDialog } from './copy-key-dialog'
+import { EditKeyDialog } from './edit-key-dialog'
+import { EditModelsDialog } from './edit-models-dialog'
 import { ModelScopeDialog } from './model-scope-dialog'
+import { TestModelsDialog } from './test-models-dialog'
+import { AddModelDialog } from './add-model-dialog'
+import { groupHandle } from '@/lib/endpoint-groups'
 
 type StatusFilter = 'all' | 'healthy' | 'issues' | 'disabled'
 
+// One collapsible section of the Keys page: a platform, or one named group of
+// custom endpoints (#1176), which is why `value` and `platform` can differ.
+interface ProviderGroup {
+  value: string
+  label: string
+  url: string
+  platform: string
+  /** Custom endpoints only: the group label, or null for the default group. */
+  customGroup?: string | null
+  keys: ApiKey[]
+}
+
 // #787: what the batch bar can do to the selected keys of one group.
 type BulkAction = 'enable' | 'disable' | 'delete'
+
+// #1403 phase 3: the balance badge names its unit with the Free tier page's
+// already-translated metric words.
+const METRIC_LABEL_KEY = {
+  requests: 'freeTier.metricRequests',
+  tokens: 'freeTier.metricTokens',
+  credits: 'freeTier.metricCredits',
+  neurons: 'freeTier.metricNeurons',
+} as const
 
 // The Providers tab body: a filter toolbar over a list of collapsible provider
 // groups. Owns the keys/health/proxy queries and every per-key mutation so
 // KeysPage stays a thin shell. `onAddKey` opens the shared Add key dialog.
 export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const queryClient = useQueryClient()
 
   const [editingKeyId, setEditingKeyId] = useState<number | null>(null)
-  const [editingLabel, setEditingLabel] = useState('')
   const [expandedKeyIds, setExpandedKeyIds] = useState<Set<number>>(new Set())
   // Explicit user open/closed overrides per provider group; absent = default.
   const [groupOverrides, setGroupOverrides] = useState<Map<string, boolean>>(new Map())
@@ -58,7 +86,9 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   // Custom endpoint whose model list is being fetched (#488) — relays change
   // what they serve constantly, so this is a repeat action, not a one-off.
-  const [discoverKeyId, setDiscoverKeyId] = useState<number | null>(null)
+  // `builtin`: a built-in provider key the catalog has no models for (#1348),
+  // whose picks register as discovered rows instead of custom-endpoint models.
+  const [discoverTarget, setDiscoverTarget] = useState<{ keyId: number; builtin: boolean } | null>(null)
   // Custom endpoint taking another credential (#702). Keyed by base URL, since
   // a key joins the pool of an endpoint rather than of the row it was opened
   // from, and every key of that endpoint offers the same action.
@@ -68,10 +98,15 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
   const [copyKey, setCopyKey] = useState<{ id: number; maskedKey: string } | null>(null)
   // Key whose model scope is being edited (#657).
   const [scopeKeyId, setScopeKeyId] = useState<number | null>(null)
+  // Re-open the post-add model picker against the current catalog (#657).
+  const [modelEditorKeyId, setModelEditorKeyId] = useState<number | null>(null)
   // #787: keys selected for bulk enable/disable/delete within a group.
   const [selectedKeyIds, setSelectedKeyIds] = useState<Set<number>>(new Set())
-  const editInputRef = useRef<HTMLInputElement>(null)
-
+  // Provider (or, for a custom endpoint, key) whose models are being test-fired,
+  // and the target a hand-typed model is being added to. Both came over from
+  // the retired Providers page; everything else that page did already lived here.
+  const [testTarget, setTestTarget] = useState<{ platform: string; keyId?: number; label: string } | null>(null)
+  const [addModelTarget, setAddModelTarget] = useState<{ platform: string; keyId?: number } | null>(null)
   const { data: keys = [], isLoading } = useQuery<ApiKey[]>({
     queryKey: ['keys'],
     queryFn: () => apiFetch('/api/keys'),
@@ -157,10 +192,11 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
   })
 
   const togglePlatform = useMutation({
-    mutationFn: ({ platform, enabled }: { platform: string; enabled: boolean }) =>
+    // `group` narrows a custom sweep to one endpoint group (#1176).
+    mutationFn: ({ platform, enabled, group }: { platform: string; enabled: boolean; group?: string | null }) =>
       apiFetch(`/api/keys/platform/${platform}`, {
         method: 'PATCH',
-        body: JSON.stringify({ enabled }),
+        body: JSON.stringify(group === undefined ? { enabled } : { enabled, group }),
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['keys'] })
@@ -219,19 +255,6 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
     },
   })
 
-  const updateKey = useMutation({
-    mutationFn: ({ id, label }: { id: number; label: string }) =>
-      apiFetch(`/api/keys/${id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ label }),
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      setEditingKeyId(null)
-      setEditingLabel('')
-    },
-  })
-
   const toggleBypass = useMutation({
     mutationFn: (platform: string) => {
       const next = bypassPlatforms.includes(platform)
@@ -242,20 +265,16 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxy-url'] }),
   })
 
+  function copyGroupHandle(label: string) {
+    const handle = `#${groupHandle(label)}`
+    void copyText(handle).then(ok => {
+      if (ok) toast.success(t('keys.groupHandleCopied', { handle }))
+      else toast.error(t('keys.groupHandleCopyFailed'))
+    })
+  }
+
   function startEditing(key: ApiKey) {
     setEditingKeyId(key.id)
-    setEditingLabel(key.label)
-  }
-
-  function cancelEditing() {
-    setEditingKeyId(null)
-    setEditingLabel('')
-  }
-
-  function saveEditing(id: number) {
-    if (editingLabel !== undefined) {
-      updateKey.mutate({ id, label: editingLabel })
-    }
   }
 
   function toggleExpandedKey(id: number) {
@@ -267,20 +286,39 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
     })
   }
 
-  useEffect(() => {
-    if (editingKeyId !== null && editInputRef.current) {
-      editInputRef.current.focus()
-    }
-  }, [editingKeyId])
-
   const healthKeyMap = new Map<number, { status: string; lastCheckedAt: string | null; lastHealthError: string | null }>()
   for (const k of healthData?.keys ?? []) healthKeyMap.set(k.id, k)
   const statusOf = (k: ApiKey) => healthKeyMap.get(k.id)?.status ?? k.status
 
-  const grouped = [...PLATFORMS, CUSTOM_GROUP].map(p => ({
-    ...p,
-    keys: keys.filter(k => k.platform === p.value),
-  })).filter(p => p.keys.length > 0)
+  // #1403 phase 3: the provider-reported balance for a key, from the same
+  // health poll the row's status already rides on. One badge per key: the
+  // lowest remaining fraction among that key's pools, since that pool is the
+  // one that runs dry first and starts routing around the key.
+  const balanceOf = balanceByKey(healthData?.quotaStates ?? [])
+
+  // #1176: custom endpoints split into one group per operator-set groupLabel;
+  // endpoints without one stay in the default "Custom" group, listed first,
+  // then the named groups A→Z. `value` only keys the expand/collapse state, so
+  // a named group's is prefixed and can never collide with a platform value;
+  // `platform` and `customGroup` are what the group's actions send to the API
+  // (null = the ungrouped endpoints).
+  const customGroups = new Map<string, ProviderGroup>()
+  for (const k of keys) {
+    if (k.platform !== 'custom') continue
+    const named = k.groupLabel?.trim() || null
+    const value = named === null ? CUSTOM_GROUP.value : `custom|${named}`
+    let group = customGroups.get(value)
+    if (!group) {
+      group = { value, label: named ?? CUSTOM_GROUP.label, url: CUSTOM_GROUP.url, platform: 'custom', customGroup: named, keys: [] }
+      customGroups.set(value, group)
+    }
+    group.keys.push(k)
+  }
+  const grouped: ProviderGroup[] = [
+    ...PLATFORMS.map(p => ({ ...p, platform: p.value, keys: keys.filter(k => k.platform === p.value) })),
+    ...[...customGroups.values()].sort((a, b) =>
+      a.customGroup === null ? -1 : b.customGroup === null ? 1 : a.label.localeCompare(b.label)),
+  ].filter(p => p.keys.length > 0)
 
   const totalProviders = grouped.length
   const totalKeys = grouped.reduce((n, g) => n + g.keys.length, 0)
@@ -299,15 +337,15 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
   }
 
   // Search narrows either whole groups (label match) or the keys within them
-  // (label / masked-key match); the status filter then trims the result set.
+  // (label / masked-key / endpoint-URL match); the status filter then trims
+  // the result set. The baseUrl term is #1056's lesson applied here: a custom
+  // row renders "api.unorouter.com" on screen, so searching that host must
+  // find the row the same way the fallback table's search does.
   const visibleGroups = grouped
     .map(group => {
       if (!q) return group
       if (group.label.toLowerCase().includes(q)) return group
-      const matchingKeys = group.keys.filter(k =>
-        (k.label ?? '').toLowerCase().includes(q) ||
-        (k.maskedKey ?? '').toLowerCase().includes(q),
-      )
+      const matchingKeys = group.keys.filter(k => keyMatchesQuery(k, q))
       return { ...group, keys: matchingKeys }
     })
     .filter(group => group.keys.length > 0 && matchStatus(group))
@@ -391,7 +429,7 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                   <Switch
                     checked={group.keys.some(k => k.enabled)}
                     onCheckedChange={(checked) =>
-                      togglePlatform.mutate({ platform: group.value, enabled: checked })
+                      togglePlatform.mutate({ platform: group.platform, enabled: checked, group: group.customGroup })
                     }
                     disabled={togglePlatform.isPending}
                   />
@@ -403,6 +441,13 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                   >
                     <h3 className="text-sm font-medium">{group.label}</h3>
                     <Badge variant="secondary" className="tabular-nums">{group.keys.length}</Badge>
+                    {group.customGroup && (
+                      <Tooltip text={t('keys.groupHandleHint', { handle: groupHandle(group.customGroup) })}>
+                        <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                          #{groupHandle(group.customGroup)}
+                        </code>
+                      </Tooltip>
+                    )}
                     <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
                       {healthyCount > 0 && (
                         <span className="inline-flex items-center gap-1">
@@ -418,8 +463,7 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                       )}
                     </span>
                   </button>
-                  {(group.url || proxyEnabled) && (
-                    <DropdownMenu>
+                  <DropdownMenu>
                       <DropdownMenuTrigger
                         className={buttonVariants({ variant: 'ghost', size: 'icon-xs' })}
                         aria-label={t('keys.providerActions')}
@@ -427,6 +471,24 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                         <MoreHorizontal />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-52">
+                        {/* Test every model this provider serves, one real ping each
+                            (custom endpoints test per key from the row instead). */}
+                        {group.platform !== 'custom' && (
+                          <DropdownMenuItem onClick={() => setTestTarget({ platform: group.platform, label: group.label })}>
+                            {t('keys.testModels')}
+                            <FlaskConical className="ml-auto size-3.5" />
+                          </DropdownMenuItem>
+                        )}
+                        {group.customGroup && (
+                          <DropdownMenuItem onClick={() => copyGroupHandle(group.customGroup!)}>
+                            {t('keys.copyGroupHandle')}
+                            <Copy className="ml-auto size-3.5" />
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem onClick={() => setAddModelTarget({ platform: group.platform })}>
+                          {t('keys.addCustomModel')}
+                          <Sparkles className="ml-auto size-3.5" />
+                        </DropdownMenuItem>
                         {group.url && (
                           <DropdownMenuItem onClick={() => window.open(group.url, '_blank', 'noopener,noreferrer')}>
                             {t('keys.getApiKey')}
@@ -435,8 +497,8 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                         )}
                         {proxyEnabled && (
                           <DropdownMenuCheckboxItem
-                            checked={!bypassPlatforms.includes(group.value)}
-                            onCheckedChange={() => toggleBypass.mutate(group.value)}
+                            checked={!bypassPlatforms.includes(group.platform)}
+                            onCheckedChange={() => toggleBypass.mutate(group.platform)}
                             closeOnClick={false}
                           >
                             {t('keys.routeViaProxy')}
@@ -444,7 +506,6 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                         )}
                       </DropdownMenuContent>
                     </DropdownMenu>
-                  )}
                   <button
                     type="button"
                     onClick={() => toggleGroup(group.value, expanded)}
@@ -506,7 +567,7 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                       const health = healthKeyMap.get(k.id)
                       const lastChecked = health?.lastCheckedAt ?? k.lastCheckedAt
                       const lastHealthError = health?.lastHealthError ?? k.lastHealthError
-                      const isEditing = editingKeyId === k.id
+                      const balance = balanceOf.get(k.id)
                       const customModels = k.models ?? []
                       const hasCustomModels = customModels.length > 0
                       const isExpanded = expandedKeyIds.has(k.id)
@@ -563,39 +624,20 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                               </Button>
                             )}
                             <code className={`text-xs font-mono flex-shrink-0 ${k.enabled ? '' : 'opacity-50'}`}>{k.maskedKey}</code>
-                            {isEditing ? (
-                              <Input
-                                ref={editInputRef}
-                                value={editingLabel}
-                                onChange={e => setEditingLabel(e.target.value)}
-                                onKeyDown={e => {
-                                  if (e.key === 'Enter') saveEditing(k.id)
-                                  if (e.key === 'Escape') cancelEditing()
-                                }}
-                                onBlur={() => saveEditing(k.id)}
-                                className="h-6 w-[160px] text-xs"
-                                disabled={updateKey.isPending}
-                              />
-                            ) : (
-                              <>
-                                {/* The label is the edit affordance itself (#705): the pencil
-                                    only appears on hover, so clicking the name is the move
-                                    everyone tries first. An unlabelled key still needs
-                                    somewhere to click, hence the muted prompt. */}
-                                <button
-                                  type="button"
-                                  onClick={() => startEditing(k)}
-                                  title={t('keys.editLabel')}
-                                  className={`rounded text-xs hover:text-foreground hover:underline underline-offset-2 ${k.label ? 'text-muted-foreground' : 'text-muted-foreground/50'} ${k.enabled ? '' : 'opacity-50'}`}
-                                >
-                                  {k.label || t('keys.editLabel')}
-                                </button>
-                                {k.baseUrl && (
-                                  <code className={`text-[11px] text-muted-foreground font-mono truncate max-w-[260px] ${k.enabled ? '' : 'opacity-50'}`} title={k.baseUrl}>
-                                    {k.baseUrl}
-                                  </code>
-                                )}
-                              </>
+                            {/* Clicking the label is still the edit affordance (#705),
+                                but the dialog also lets a credential be replaced in place. */}
+                            <button
+                              type="button"
+                              onClick={() => startEditing(k)}
+                              title={t('keys.editKey')}
+                              className={`max-w-[220px] truncate rounded text-xs hover:text-foreground hover:underline underline-offset-2 ${k.label ? 'text-muted-foreground' : 'text-muted-foreground/50'} ${k.enabled ? '' : 'opacity-50'}`}
+                            >
+                              {k.label || t('keys.editKey')}
+                            </button>
+                            {k.baseUrl && (
+                              <code className={`text-[11px] text-muted-foreground font-mono truncate max-w-[260px] ${k.enabled ? '' : 'opacity-50'}`} title={k.baseUrl}>
+                                {k.baseUrl}
+                              </code>
                             )}
                             <span className={`text-xs text-muted-foreground ${k.enabled ? '' : 'opacity-50'}`}>{statusLabelKey[status] ? t(statusLabelKey[status]) : status}</span>
                             {/* Only a SCOPED key shows anything (#657); an unscoped one stays as it always was. */}
@@ -608,6 +650,29 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                                 {t(k.modelScope!.length === 1 ? 'keys.modelScopeBadgeOne' : 'keys.modelScopeBadgeOther', { count: k.modelScope!.length })}
                               </Badge>
                             )}
+                            {/* #1403 phase 3: the provider-reported balance (#1403).
+                                Amber at ≤20% left — the same low-balance signal the
+                                Quota outlook panel gives, but visible where the operator
+                                actually scans keys instead of on a second tab. */}
+                            {balance && (
+                              <Tooltip
+                                text={balance.limit != null
+                                  ? t('keys.quotaBalanceHint', { remaining: new Intl.NumberFormat(locale).format(balance.remaining), limit: new Intl.NumberFormat(locale).format(balance.limit), metric: t(METRIC_LABEL_KEY[balance.metric]) })
+                                  : t('keys.quotaBalanceLeft', { remaining: new Intl.NumberFormat(locale).format(balance.remaining) })}
+                              >
+                                <Badge
+                                  variant="outline"
+                                  aria-label={t('keys.quotaBalanceLeft', { remaining: new Intl.NumberFormat(locale).format(balance.remaining) })}
+                                  className={`text-[10px] tabular-nums ${balance.fraction != null && balance.fraction <= 0.2
+                                    ? 'border-amber-600/30 text-amber-700 dark:text-amber-300'
+                                    : 'text-muted-foreground'} ${k.enabled ? '' : 'opacity-50'}`}
+                                >
+                                  {balance.limit != null && balance.fraction != null
+                                    ? `${Math.round(balance.fraction * 100)}% ${t(METRIC_LABEL_KEY[balance.metric])}`
+                                    : `${new Intl.NumberFormat(locale).format(balance.remaining)} ${t(METRIC_LABEL_KEY[balance.metric])}`}
+                                </Badge>
+                              </Tooltip>
+                            )}
                             <div className="flex-1" />
                             {lastChecked && (
                               <span className="text-[11px] text-muted-foreground tabular-nums">
@@ -615,16 +680,27 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                               </span>
                             )}
                             <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/krow:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100">
-                              {!isEditing && (
-                                <Button
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  onClick={() => startEditing(k)}
-                                  aria-label={t('keys.editLabel')}
-                                  title={t('keys.editLabel')}
-                                >
-                                  <Pencil className="size-3" />
-                                </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-xs"
+                                onClick={() => startEditing(k)}
+                                aria-label={t('keys.editKey')}
+                                title={t('keys.editKey')}
+                              >
+                                <Pencil className="size-3" />
+                              </Button>
+                              {!k.keyless && (
+                                <Tooltip text={t('keys.editModels')}>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon-xs"
+                                    onClick={() => setModelEditorKeyId(k.id)}
+                                    aria-label={t('keys.editModels')}
+                                    title={t('keys.editModels')}
+                                  >
+                                    <Layers className="size-3" />
+                                  </Button>
+                                </Tooltip>
                               )}
                               {!k.keyless && (
                                 <Tooltip text={t('keys.copyFullKey')}>
@@ -635,6 +711,18 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                                     aria-label={t('keys.copyFullKey')}
                                   >
                                     <Copy className="size-3" />
+                                  </Button>
+                                </Tooltip>
+                              )}
+                              {k.platform !== 'custom' && k.modelDiscovery && (
+                                <Tooltip text={t('keys.discoverModels')}>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon-xs"
+                                    onClick={() => setDiscoverTarget({ keyId: k.id, builtin: true })}
+                                    aria-label={t('keys.discoverModels')}
+                                  >
+                                    <ListPlus className="size-3" />
                                   </Button>
                                 </Tooltip>
                               )}
@@ -654,10 +742,30 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                                     <Button
                                       variant="ghost"
                                       size="icon-xs"
-                                      onClick={() => setDiscoverKeyId(k.id)}
+                                      onClick={() => setDiscoverTarget({ keyId: k.id, builtin: false })}
                                       aria-label={t('keys.discoverModels')}
                                     >
                                       <ListPlus className="size-3" />
+                                    </Button>
+                                  </Tooltip>
+                                  <Tooltip text={t('keys.addCustomModel')}>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      onClick={() => setAddModelTarget({ platform: 'custom', keyId: k.id })}
+                                      aria-label={t('keys.addCustomModel')}
+                                    >
+                                      <Sparkles className="size-3" />
+                                    </Button>
+                                  </Tooltip>
+                                  <Tooltip text={t('keys.testModels')}>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      onClick={() => setTestTarget({ platform: 'custom', keyId: k.id, label: k.label || k.baseUrl! })}
+                                      aria-label={t('keys.testModels')}
+                                    >
+                                      <FlaskConical className="size-3" />
                                     </Button>
                                   </Tooltip>
                                   <Tooltip text={t('keys.probeNow')}>
@@ -764,11 +872,12 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
         </div>
       )}
 
-      {discoverKeyId !== null && (
+      {discoverTarget !== null && (
         <DiscoverModelsDialog
           open
-          onOpenChange={(open) => { if (!open) setDiscoverKeyId(null) }}
-          endpoint={{ keyId: discoverKeyId }}
+          onOpenChange={(open) => { if (!open) setDiscoverTarget(null) }}
+          endpoint={{ keyId: discoverTarget.keyId }}
+          builtin={discoverTarget.builtin}
         />
       )}
 
@@ -777,6 +886,24 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
           open
           onOpenChange={(open) => { if (!open) setAddKeyBaseUrl(null) }}
           baseUrl={addKeyBaseUrl}
+        />
+      )}
+
+      {testTarget !== null && (
+        <TestModelsDialog
+          platform={testTarget.platform}
+          keyId={testTarget.keyId}
+          label={testTarget.label}
+          onOpenChange={(open) => { if (!open) setTestTarget(null) }}
+        />
+      )}
+
+      {addModelTarget !== null && (
+        <AddModelDialog
+          open
+          initialPlatform={addModelTarget.platform}
+          initialKeyId={addModelTarget.keyId}
+          onOpenChange={(open) => { if (!open) setAddModelTarget(null) }}
         />
       )}
 
@@ -795,6 +922,25 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
           <ModelScopeDialog
             apiKey={scopeKey}
             onOpenChange={(open) => { if (!open) setScopeKeyId(null) }}
+          />
+        ) : null
+      })()}
+      {(() => {
+        const modelKey = modelEditorKeyId !== null ? keys.find(k => k.id === modelEditorKeyId) : undefined
+        return modelKey ? (
+          <EditModelsDialog
+            apiKey={modelKey}
+            onOpenChange={(open) => { if (!open) setModelEditorKeyId(null) }}
+          />
+        ) : null
+      })()}
+      {(() => {
+        // Resolved from the live query so a successful save closes on fresh data.
+        const editKey = editingKeyId !== null ? keys.find(k => k.id === editingKeyId) : undefined
+        return editKey ? (
+          <EditKeyDialog
+            apiKey={editKey}
+            onOpenChange={(open) => { if (!open) setEditingKeyId(null) }}
           />
         ) : null
       })()}

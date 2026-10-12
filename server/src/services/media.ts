@@ -8,15 +8,23 @@
 // published catalog and arrive via catalog-sync (premium on the live tier within
 // ~12h, free once each model is 30 days old) — never seeded by migrations.
 import { getDb } from '../db/index.js';
+import { parseRetryAfterMs } from '../providers/base.js';
+import { RetryHintTracker } from '../lib/retry-hint.js';
+import { secondsUntilNextMonth } from './key-budget.js';
 import { getClientContext } from '../lib/client-context.js';
-import { decrypt } from '../lib/crypto.js';
+import { reserveProviderCredential } from './provider-credential.js';
 import { proxyFetch } from '../lib/proxy.js';
+import { bearerAuthHeader } from '../lib/credential.js';
 import { assessProviderUrl } from '../lib/url-guard.js';
 import { isOnCooldown, setCooldown } from './ratelimit.js';
+import { SPEECHIFY_BASE_URL, SPEECHIFY_VERSION } from '../providers/speechify.js';
+import { TYPHOON_BASE_URL } from '../providers/typhoon.js';
+import { ELECTRONHUB_BASE_URL } from '../providers/electronhub.js';
+import { FREEAI_BASE_URL, freeAiAudioUrl } from '../providers/freeai.js';
 
 /** Platforms with a media adapter below. catalog-sync gates media rows on this
  *  (decoupled from the chat provider registry — e.g. SiliconFlow is media-only). */
-export const MEDIA_PLATFORMS = new Set(['nvidia', 'pollinations', 'cloudflare', 'siliconflow', 'google']);
+export const MEDIA_PLATFORMS = new Set(['nvidia', 'pollinations', 'cloudflare', 'siliconflow', 'google', 'speechify', 'electronhub', 'freeai']);
 
 /** Video uses a dedicated optional catalog registry so binaries that predate
  *  this modality ignore the rows instead of accidentally ingesting them as
@@ -29,7 +37,7 @@ const KEYLESS_CAPABLE = new Set(['pollinations']);
 /** Platforms with a speech-to-text adapter below. catalog-sync gates the
  *  catalog's `transcriptionModels` entries on this, the way MEDIA_PLATFORMS
  *  gates the generative-media rows. */
-export const TRANSCRIPTION_PLATFORMS = new Set(['groq', 'cloudflare']);
+export const TRANSCRIPTION_PLATFORMS = new Set(['groq', 'cloudflare', 'typhoon']);
 
 // 'transcription' rows live in media_models like the other modalities; they
 // arrive via the catalog's dedicated `transcriptionModels` array (see
@@ -55,10 +63,15 @@ export class MediaError extends Error {
   status: number;
   /** Optional machine-readable error code surfaced in the OpenAI-shaped body. */
   code?: string;
-  constructor(message: string, status: number, code?: string) {
+  /** Back-off the upstream provider stated (`Retry-After` header), in
+   *  milliseconds — relayed to the client so an SDK sleeps the stated amount
+   *  instead of hammering the chain, mirroring the embeddings path. */
+  retryAfterMs?: number;
+  constructor(message: string, status: number, code?: string, retryAfterMs?: number) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -243,50 +256,10 @@ export function listAllMediaModels(): MediaModelRow[] {
 }
 
 interface ProviderCredential {
+  release?: () => void;
   id: number | null;
   key: string | null;
   baseUrl: string | null;
-}
-
-function getProviderCredential(
-  row: Pick<MediaModelRow, 'platform' | 'key_id'>,
-  /** Keys already tried (and failed) for this request, so a retry picks another. */
-  excludeKeyIds: ReadonlySet<number> = new Set(),
-): ProviderCredential | null {
-  if (row.key_id != null) {
-    const keyRow = getDb()
-      .prepare("SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE id = ? AND enabled = 1 AND status IN ('healthy', 'unknown') LIMIT 1")
-      .get(row.key_id) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
-    if (!keyRow) return null;
-    try {
-      return {
-        id: keyRow.id,
-        key: decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag),
-        baseUrl: keyRow.base_url?.trim().replace(/\/+$/, '') ?? null,
-      };
-    } catch {
-      return null;
-    }
-  }
-  if (row.platform === 'custom') return null;
-
-  // Ids are integers from our own loop, so inlining them is injection-safe.
-  const exclusion = excludeKeyIds.size > 0
-    ? ` AND id NOT IN (${[...excludeKeyIds].map(id => Math.trunc(id)).join(',')})`
-    : '';
-  const keyRow = getDb()
-    .prepare(`SELECT id, encrypted_key, iv, auth_tag, base_url FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')${exclusion} ORDER BY RANDOM() LIMIT 1`)
-    .get(row.platform) as { id: number; encrypted_key: string; iv: string; auth_tag: string; base_url: string | null } | undefined;
-  if (!keyRow) return null;
-  try {
-    return {
-      id: keyRow.id,
-      key: decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag),
-      baseUrl: keyRow.base_url?.trim().replace(/\/+$/, '') ?? null,
-    };
-  } catch {
-    return null;
-  }
 }
 
 async function mediaFetch(
@@ -311,7 +284,12 @@ async function mediaFetch(
   );
   if (!r.ok) {
     const body = await r.text().catch(() => '');
-    throw new MediaError(`${platform} ${r.status}: ${body.slice(0, 200)}`, r.status);
+    throw new MediaError(
+      `${platform} ${r.status}: ${body.slice(0, 200)}`,
+      r.status,
+      undefined,
+      parseRetryAfterMs(r.headers?.get('retry-after') ?? null),
+    );
   }
   return r;
 }
@@ -417,7 +395,7 @@ async function callImageProvider(
       if (p.size) body.size = p.size;
       const r = await mediaFetch(`${credential.baseUrl}/images/generations`, 'custom', 'image', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key ?? 'no-key'}` },
+        headers: { 'Content-Type': 'application/json', ...bearerAuthHeader(key) },
         body: JSON.stringify(body),
       });
       const j = (await r.json()) as { data?: { b64_json?: string; url?: string }[] };
@@ -653,6 +631,100 @@ async function callSpeechProvider(
 ): Promise<{ audio: Buffer; contentType: string }> {
   const key = credential.key;
   switch (row.platform) {
+    case 'freeai': {
+      if (!key) throw new MediaError('Free.ai API key required', 401);
+      if (row.model_id !== 'kokoro') throw new MediaError('Free.ai currently supports only the tested Kokoro speech route', 400);
+      if (p.format && p.format !== 'wav') throw new MediaError('Free.ai Kokoro supports wav output through this adapter', 400);
+      const standardVoices = new Set(['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer', 'verse', 'marin', 'cedar']);
+      const voice = !p.voice || standardVoices.has(p.voice.toLowerCase()) ? 'af_heart' : p.voice;
+      const r = await mediaFetch(`${FREEAI_BASE_URL}/v1/tts/`, 'freeai', 'audio', {
+        method: 'POST', redirect: 'error',
+        headers: { 'Content-Type': 'application/json', ...bearerAuthHeader(key) },
+        body: JSON.stringify({ model: row.model_id, text: p.input, voice }),
+      });
+      const body: unknown = await r.json();
+      if (body && typeof body === 'object' && 'queued' in body && body.queued === true) {
+        // The website uses session-based polling for queued jobs; its
+        // API status endpoint did not expose our tested job. Never follow an
+        // arbitrary poll_url or submit the same generation again automatically.
+        throw new MediaError('Free.ai queued this speech job; audio is not yet available. Check the Free.ai account history before retrying.', 502, 'upstream_queued');
+      }
+      const url = freeAiAudioUrl(body);
+      if (!url) throw new MediaError('Free.ai returned a missing or unsafe audio URL', 502);
+      // Output is public on the same fixed host. Never forward the credential,
+      // follow redirects or download arbitrary URLs supplied by an upstream.
+      const output = await mediaFetch(url, 'freeai', 'audio', { method: 'GET', redirect: 'error' });
+      const maxBytes = 20 * 1024 * 1024;
+      if (Number(output.headers.get('content-length')) > maxBytes || !output.body) {
+        await output.body?.cancel();
+        throw new MediaError('Free.ai speech output is missing or too large', 502);
+      }
+      const reader = output.body.getReader(), chunks: Buffer[] = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.length;
+          if (size > maxBytes) {
+            await reader.cancel();
+            throw new MediaError('Free.ai speech output is too large', 502);
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally { reader.releaseLock(); }
+      const audio = Buffer.concat(chunks);
+      if (audio.length <= 44 || audio.toString('ascii', 0, 4) !== 'RIFF' || audio.toString('ascii', 8, 12) !== 'WAVE') {
+        throw new MediaError('Free.ai returned no recognized WAV audio', 502);
+      }
+      return { audio, contentType: 'audio/wav' };
+    }
+    case 'speechify': {
+      const fmt = p.format ?? 'mp3';
+      // Speechify exposes ogg, not OpenAI's opus name. Do not silently return
+      // a different codec for unsupported formats such as pcm or flac.
+      if (!['mp3', 'wav', 'ogg', 'aac'].includes(fmt)) {
+        throw new MediaError('Speechify supports mp3, wav, ogg and aac audio formats', 400);
+      }
+      const standardVoices = new Set(['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer', 'verse', 'marin', 'cedar']);
+      const voice = !p.voice || standardVoices.has(p.voice.toLowerCase()) ? 'alec' : p.voice;
+      const r = await mediaFetch(`${SPEECHIFY_BASE_URL}/audio/speech`, 'speechify', 'audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, 'Speechify-Version': SPEECHIFY_VERSION },
+        body: JSON.stringify({ model: row.model_id, input: p.input, voice_id: voice, audio_format: fmt }),
+      });
+      const j = await r.json() as { audio_data?: unknown; audio_format?: unknown };
+      const b64 = j.audio_data;
+      if (typeof b64 !== 'string' || !b64 || b64.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(b64)) {
+        throw new MediaError('Speechify returned missing or invalid base64 audio', 502);
+      }
+      if (j.audio_format !== fmt) throw new MediaError('Speechify returned a different audio format', 502);
+      return { audio: Buffer.from(b64, 'base64'), contentType: fmt === 'ogg' ? 'audio/ogg' : contentTypeFor(fmt) };
+    }
+    case 'electronhub': {
+      // Only the container formats exercised by this adapter are supported.
+      // Gemini TTS may return WAV even for response_format=mp3. Detect the
+      // actual bytes instead of labelling WAV as MP3 or accepting a JSON error.
+      const format = p.format ?? 'mp3';
+      if (!['mp3', 'wav'].includes(format)) {
+        throw new MediaError('ElectronHub speech supports mp3 and wav output through this adapter', 400);
+      }
+      const defaultVoice = row.model_id === 'humain-tts' ? 'sara'
+        : row.model_id.startsWith('gemini-') ? 'Kore' : 'alloy';
+      const voice = !p.voice || p.voice === 'alloy' ? defaultVoice : p.voice;
+      const r = await mediaFetch(`${ELECTRONHUB_BASE_URL}/audio/speech`, 'electronhub', 'audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...bearerAuthHeader(key) },
+        body: JSON.stringify({ model: row.model_id, input: p.input, voice, response_format: format }),
+      });
+      const audio = Buffer.from(await r.arrayBuffer());
+      const wav = audio.length > 44 && audio.toString('ascii', 0, 4) === 'RIFF'
+        && audio.toString('ascii', 8, 12) === 'WAVE';
+      const mp3 = audio.length > 10 && (audio.toString('ascii', 0, 3) === 'ID3'
+        || (audio[0] === 0xff && (audio[1] & 0xe0) === 0xe0 && (audio[1] & 0x06) !== 0));
+      if (!wav && !mp3) throw new MediaError('ElectronHub returned no recognized speech audio', 502);
+      return { audio, contentType: wav ? 'audio/wav' : 'audio/mpeg' };
+    }
     case 'custom': {
       if (!credential.baseUrl) throw new MediaError('custom audio provider is missing base_url', 500);
       const fmt = p.format ?? 'mp3';
@@ -661,7 +733,7 @@ async function callSpeechProvider(
       if (p.format) body.response_format = p.format;
       const r = await mediaFetch(`${credential.baseUrl}/audio/speech`, 'custom', 'audio', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key ?? 'no-key'}` },
+        headers: { 'Content-Type': 'application/json', ...bearerAuthHeader(key) },
         body: JSON.stringify(body),
       });
       return {
@@ -791,7 +863,7 @@ function logMedia(row: Pick<MediaModelRow, 'platform' | 'model_id' | 'modality'>
   }
 }
 
-function chainError(modality: MediaModality, lastError: MediaError | null): MediaError {
+function chainError(modality: MediaModality, lastError: MediaError | null, hints: RetryHintTracker): MediaError {
   // Only statuses the CALLER can act on are passed through. 400 (bad prompt,
   // duration the model does not accept) and 413 (upload too large) describe
   // the caller's own request, and 429 is the long-standing rate-limit signal.
@@ -805,6 +877,11 @@ function chainError(modality: MediaModality, lastError: MediaError | null): Medi
   return new MediaError(
     `All ${modality} providers failed${lastError ? ` (last: ${lastError.message.slice(0, 160)})` : ' (no usable keys)'}.`,
     status,
+    lastError?.code,
+    // A 429 from one provider is failed over, so its Retry-After is only the
+    // client's business when EVERY provider was rate limited with a stated
+    // delay — then the soonest one (same rule as the chat exhaustion path).
+    status === 429 ? hints.retryAfterMs() : undefined,
   );
 }
 
@@ -812,11 +889,19 @@ function chainError(modality: MediaModality, lastError: MediaError | null): Medi
 export async function runImageGeneration(model: string | undefined, params: ImageParams): Promise<ImageResult> {
   const chain = resolveMediaChain(model, 'image');
   let lastError: MediaError | null = null;
+  // Only a chain rate limited end to end earns a Retry-After (the soonest).
+  const hints = new RetryHintTracker();
   for (const row of chain) {
-    const credential = KEYLESS_CAPABLE.has(row.platform)
-      ? { id: null, key: null, baseUrl: null }
-      : getProviderCredential(row);
-    if (!credential) continue; // no usable key for this provider — try the next
+    const { credential, budgetBlocked } = KEYLESS_CAPABLE.has(row.platform)
+      ? { credential: { id: null, key: null, baseUrl: null, release: () => {} }, budgetBlocked: false }
+      : reserveProviderCredential(row, 0);
+    if (!credential) {
+      if (budgetBlocked) {
+        lastError = new MediaError('Monthly key budget exhausted', 429, 'quota_exceeded');
+        hints.record(429, secondsUntilNextMonth() * 1000);
+      }
+      continue;
+    }
     const started = Date.now();
     try {
       const images = await callImageProvider(row, credential, params);
@@ -829,9 +914,12 @@ export async function runImageGeneration(model: string | undefined, params: Imag
       const e = err instanceof MediaError ? err : new MediaError(String(err?.message ?? err), 502);
       logMedia(row, credential.id, 'error', Date.now() - started, e.message.slice(0, 300));
       lastError = e;
+      hints.record(e.status, e.retryAfterMs);
+    } finally {
+      credential.release();
     }
   }
-  throw chainError('image', lastError);
+  throw chainError('image', lastError, hints);
 }
 
 /** Generate a video, failing over across catalogued text-to-video providers.
@@ -844,11 +932,19 @@ export async function runVideoGeneration(
 ): Promise<VideoResult> {
   const chain = resolveMediaChain(model, 'video');
   let lastError: MediaError | null = null;
+  // Only a chain rate limited end to end earns a Retry-After (the soonest).
+  const hints = new RetryHintTracker();
   for (const row of chain) {
     throwIfClientGone(clientSignal);
-    const credential = getProviderCredential(row);
-    if (!credential) continue;
-    if (credential.id != null && isOnCooldown(row.platform, row.model_id, credential.id)) continue;
+    const { credential, budgetBlocked } = reserveProviderCredential(row, 0,
+      keyId => isOnCooldown(row.platform, row.model_id, keyId));
+    if (!credential) {
+      if (budgetBlocked) {
+        lastError = new MediaError('Monthly key budget exhausted', 429, 'quota_exceeded');
+        hints.record(429, secondsUntilNextMonth() * 1000);
+      }
+      continue;
+    }
     const started = Date.now();
     try {
       const out = await callVideoProvider(row, credential, params, clientSignal);
@@ -860,11 +956,14 @@ export async function runVideoGeneration(
       logMedia(row, credential.id, 'error', Date.now() - started, e.message.slice(0, 300));
       if (e.status === 429 && credential.id != null) setCooldown(row.platform, row.model_id, credential.id);
       lastError = e;
+      hints.record(e.status, e.retryAfterMs);
       // A caller that hung up gets no second generation charged to its account.
       throwIfClientGone(clientSignal);
+    } finally {
+      credential.release();
     }
   }
-  throw chainError('video', lastError);
+  throw chainError('video', lastError, hints);
 }
 
 // ---------------------------------------------------------------------------
@@ -907,7 +1006,7 @@ interface SttCandidate {
   platform: string;
   modelId: string;
   /** The api_keys row this model is bound to, or null to pick any healthy key
-   *  for the platform. Custom endpoints ALWAYS carry one: getProviderCredential
+   *  for the platform. Custom endpoints ALWAYS carry one: reserveProviderCredential
    *  refuses to guess a key for platform 'custom', so dropping this here would
    *  silently skip every custom STT row. */
   keyId: number | null;
@@ -1010,6 +1109,22 @@ async function callTranscriptionProvider(
 ): Promise<Omit<TranscriptionResult, 'platform' | 'modelId'>> {
   const key = credential.key;
   switch (m.platform) {
+    case 'typhoon': {
+      // The tested API accepts file + model and returns {text, usage}.
+      // Do not forward Whisper-only options or claim native subtitle support.
+      // The route derives text/JSON response formats from this normalized result.
+      const form = new FormData();
+      form.append('file', new Blob([p.file], { type: p.mimeType || 'application/octet-stream' }), p.filename);
+      form.append('model', m.modelId);
+      const r = await mediaFetch(`${TYPHOON_BASE_URL}/audio/transcriptions`, 'typhoon', 'transcription', {
+        method: 'POST',
+        headers: { ...bearerAuthHeader(key) },
+        body: form,
+      });
+      const j = (await r.json()) as { text?: unknown } | null;
+      if (!j || typeof j.text !== 'string') throw new MediaError('typhoon returned no transcription text', 502);
+      return { text: j.text };
+    }
     case 'custom': {
       // Any OpenAI-compatible STT server (faster-whisper-server, LocalAI,
       // whisper.cpp's server, vLLM…). Same multipart shape as groq below;
@@ -1028,7 +1143,7 @@ async function callTranscriptionProvider(
       // Never set Content-Type by hand — FormData supplies the boundary.
       const r = await mediaFetch(`${credential.baseUrl}/audio/transcriptions`, 'custom', 'transcription', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key ?? 'no-key'}` },
+        headers: { ...bearerAuthHeader(key) },
         body: form,
       });
       const j = (await r.json()) as { text?: string; language?: string; duration?: number; segments?: unknown[] };
@@ -1111,10 +1226,18 @@ export async function runTranscription(model: string | undefined, p: Transcripti
     throw new MediaError(`Audio file exceeds the ${maxMb} MB provider upload limit.`, 413);
   }
   let lastError: MediaError | null = null;
+  // Only a chain rate limited end to end earns a Retry-After (the soonest).
+  const hints = new RetryHintTracker();
   for (const m of usable) {
-    const credential = getProviderCredential({ platform: m.platform, key_id: m.keyId });
-    if (!credential) continue; // no usable key for this provider — try the next
-    if (credential.id != null && isOnCooldown(m.platform, m.modelId, credential.id)) continue;
+    const { credential, budgetBlocked } = reserveProviderCredential({ platform: m.platform, key_id: m.keyId }, 0,
+      keyId => isOnCooldown(m.platform, m.modelId, keyId));
+    if (!credential) {
+      if (budgetBlocked) {
+        lastError = new MediaError('Monthly key budget exhausted', 429, 'quota_exceeded');
+        hints.record(429, secondsUntilNextMonth() * 1000);
+      }
+      continue;
+    }
     const logRow = { platform: m.platform, model_id: m.modelId, modality: 'transcription' as const };
     const started = Date.now();
     try {
@@ -1131,9 +1254,12 @@ export async function runTranscription(model: string | undefined, p: Transcripti
         setCooldown(m.platform, m.modelId, credential.id);
       }
       lastError = e;
+      hints.record(e.status, e.retryAfterMs);
+    } finally {
+      credential.release();
     }
   }
-  throw chainError('transcription', lastError);
+  throw chainError('transcription', lastError, hints);
 }
 
 /** What a failed ElevenLabs call says about the KEY (not the request):
@@ -1182,17 +1308,22 @@ function applyKeyFailure(chain: MediaModelRow[], keyId: number, failure: KeyFail
 export async function runSpeech(model: string | undefined, params: SpeechParams): Promise<SpeechResult> {
   const chain = resolveMediaChain(model, 'audio');
   let lastError: MediaError | null = null;
+  // Only a chain rate limited end to end earns a Retry-After (the soonest).
+  const hints = new RetryHintTracker();
   for (const row of chain) {
     const rotatesKeys = row.platform === 'elevenlabs' && row.key_id == null;
     const triedKeyIds = new Set<number>();
     for (;;) {
-      const credential = KEYLESS_CAPABLE.has(row.platform)
-        ? { id: null, key: null, baseUrl: null }
-        : getProviderCredential(row, triedKeyIds);
-      if (!credential) break;
-      if (rotatesKeys && credential.id != null && isOnCooldown(row.platform, row.model_id, credential.id)) {
-        triedKeyIds.add(credential.id);
-        continue;
+      const { credential, budgetBlocked } = KEYLESS_CAPABLE.has(row.platform)
+        ? { credential: { id: null, key: null, baseUrl: null, release: () => {} }, budgetBlocked: false }
+        : reserveProviderCredential(row, 0, keyId =>
+          triedKeyIds.has(keyId) || (rotatesKeys && isOnCooldown(row.platform, row.model_id, keyId)));
+      if (!credential) {
+        if (budgetBlocked) {
+          lastError = new MediaError('Monthly key budget exhausted', 429, 'quota_exceeded');
+          hints.record(429, secondsUntilNextMonth() * 1000);
+        }
+        break;
       }
       const started = Date.now();
       try {
@@ -1204,6 +1335,7 @@ export async function runSpeech(model: string | undefined, params: SpeechParams)
         const e = err instanceof MediaError ? err : new MediaError(String(err?.message ?? err), 502);
         logMedia(row, credential.id, 'error', Date.now() - started, e.message.slice(0, 300));
         lastError = e;
+        hints.record(e.status, e.retryAfterMs);
         const failure = rotatesKeys && credential.id != null ? elevenLabsKeyFailure(e) : null;
         if (failure && credential.id != null) {
           applyKeyFailure(chain, credential.id, failure, e.message);
@@ -1211,10 +1343,12 @@ export async function runSpeech(model: string | undefined, params: SpeechParams)
           continue; // try another ElevenLabs key for this model
         }
         break;
+      } finally {
+        credential.release();
       }
     }
   }
-  throw chainError('audio', lastError);
+  throw chainError('audio', lastError, hints);
 }
 
 // ElevenLabs rows are seeded locally rather than by catalog-sync: the
