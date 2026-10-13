@@ -3,7 +3,7 @@ name: Sync upstream and deploy
 # Fork-only workflow (not present upstream, so merges never conflict on it).
 # Weekly: merge tashfeenahmed/freellmapi main into our main, verify, push, then
 # trigger the Render deploy hook. Conflicts or failed checks push nothing and
-# open an issue instead.
+# fail the run (see the run summary).
 
 on:
   schedule:
@@ -17,7 +17,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: sync-upstream
@@ -61,21 +60,18 @@ jobs:
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open issue on merge conflict
+      # Issues are off by default on forks, so report in the run summary and
+      # fail the job (GitHub emails the owner about failed scheduled runs).
+      - name: Report merge conflict
         if: steps.merge.outputs.conflict == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           {
+            echo "### Upstream sync blocked by merge conflict"
             echo "Merging upstream/main ($(git rev-parse --short upstream/main)) into main conflicts in:"
-            echo
             sed 's/^/- /' conflicts.txt
             echo
             echo "Nothing was pushed or deployed. Resolve on a branch (git merge upstream/main), test, push main, then run this workflow again or deploy manually on Render."
-            echo
-            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } > issue.md
-          gh issue create --title "Upstream sync blocked by merge conflict ($(date -u +%F))" --body-file issue.md
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
 
       - name: Set up Node
@@ -120,12 +116,3 @@ jobs:
           fi
           curl -fsS -X POST "$RENDER_DEPLOY_HOOK" > /dev/null
           echo "Render deploy triggered"
-
-      - name: Open issue on failure
-        if: failure() && steps.merge.outputs.conflict != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh issue create \
-            --title "Upstream sync failed ($(date -u +%F))" \
-            --body "A check failed after merging upstream/main. Nothing was pushed or deployed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
