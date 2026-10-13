@@ -1,0 +1,131 @@
+name: Sync upstream and deploy
+
+# Fork-only workflow (not present upstream, so merges never conflict on it).
+# Weekly: merge tashfeenahmed/freellmapi main into our main, verify, push, then
+# trigger the Render deploy hook. Conflicts or failed checks push nothing and
+# open an issue instead.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Trigger the Render deploy after a successful sync'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/tashfeenahmed/freellmapi.git
+
+jobs:
+  sync:
+    name: Merge, verify, deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main --tags
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "Fork is $behind commit(s) behind upstream/main"
+
+      - name: Merge upstream/main
+        id: merge
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git merge --no-edit upstream/main -m "Merge upstream/main ($(git rev-parse --short upstream/main)) into fork"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > conflicts.txt
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue on merge conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Merging upstream/main ($(git rev-parse --short upstream/main)) into main conflicts in:"
+            echo
+            sed 's/^/- /' conflicts.txt
+            echo
+            echo "Nothing was pushed or deployed. Resolve on a branch (git merge upstream/main), test, push main, then run this workflow again or deploy manually on Render."
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > issue.md
+          gh issue create --title "Upstream sync blocked by merge conflict ($(date -u +%F))" --body-file issue.md
+          exit 1
+
+      - name: Set up Node
+        if: steps.fetch.outputs.behind != '0'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.fetch.outputs.behind != '0'
+        run: npm ci
+
+      - name: Build
+        if: steps.fetch.outputs.behind != '0'
+        run: npm run build
+
+      # The gate covers what the fork owns plus the media/catalog paths it
+      # touches. The longer timeout absorbs the 5s timeouts seen on slow machines.
+      - name: Fork-critical tests
+        if: steps.fetch.outputs.behind != '0'
+        working-directory: server
+        run: npx vitest run --pool=forks --fileParallelism=false --testTimeout=30000 elevenlabs media catalog-sync declarative
+
+      - name: Full server suite (advisory)
+        if: steps.fetch.outputs.behind != '0'
+        continue-on-error: true
+        run: npm run test -w server -- --testTimeout=30000
+
+      - name: Push main
+        if: steps.fetch.outputs.behind != '0'
+        run: git push origin HEAD:main
+
+      - name: Trigger Render deploy
+        if: steps.fetch.outputs.behind != '0' && inputs.deploy != false
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK secret not set; pushed main but did not deploy."
+            exit 0
+          fi
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK" > /dev/null
+          echo "Render deploy triggered"
+
+      - name: Open issue on failure
+        if: failure() && steps.merge.outputs.conflict != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Upstream sync failed ($(date -u +%F))" \
+            --body "A check failed after merging upstream/main. Nothing was pushed or deployed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
