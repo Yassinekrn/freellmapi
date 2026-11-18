@@ -1172,7 +1172,12 @@ export function routingExhaustionBody(routeErr: any): ExhaustionBody {
   }
 
   if (classes.some(c => c === 'time_bound') && classes.every(c => c !== 'other')) {
-    const retryAtMs = getSoonestCooldownExpiry() ?? undefined;
+    // Prefer the router's own reopen time for THIS request's candidates: it also
+    // covers rpd/tpd ledger blocks, which leave no cooldown row behind.
+    const scoped = typeof routeErr?.retryAtMs === 'number' && routeErr.retryAtMs > Date.now()
+      ? routeErr.retryAtMs as number
+      : undefined;
+    const retryAtMs = scoped ?? getSoonestCooldownExpiry() ?? undefined;
     return {
       kind: 'rate_limit',
       status: 429,

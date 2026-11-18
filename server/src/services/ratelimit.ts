@@ -39,6 +39,36 @@ function msSinceUtcMidnight(now: number): number {
   return now - new Date(now).setUTCHours(0, 0, 0, 0);
 }
 
+const pacificClock = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Los_Angeles',
+  hourCycle: 'h23',
+  hour: 'numeric',
+  minute: 'numeric',
+  second: 'numeric',
+});
+
+/** Milliseconds elapsed since the most recent midnight in America/Los_Angeles. */
+export function msSincePacificMidnight(now: number): number {
+  const parts = pacificClock.formatToParts(now);
+  const part = (name: string) => Number(parts.find(p => p.type === name)?.value ?? 0);
+  return ((part('hour') * 60 + part('minute')) * 60 + part('second')) * 1000 + (now % 1000);
+}
+
+/**
+ * Width of the per-model daily (rpd/tpd) window for a platform at `now`.
+ *
+ * Google resets every Gemini free-tier daily quota at midnight Pacific
+ * (ai.google.dev/gemini-api/docs/rate-limits). A sliding 24h window held a key
+ * benched for up to a day after Google had already reset it: 20 requests at
+ * 23:00 PT kept that key+model unusable until 23:00 the next day, wasting most of
+ * the key's real allowance. Everything else keeps the sliding window, since
+ * their reset convention is unknown or rolling.
+ */
+export function dailyWindowMs(platform: string, now: number): number {
+  if (platform === 'google') return Math.min(DAY, msSincePacificMidnight(now));
+  return DAY;
+}
+
 function withDb<T>(fn: (db: RateLimitDb) => T): T | undefined {
   try {
     return fn(getDb());
@@ -296,6 +326,13 @@ function requestCount(
   return memoryRequestCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now);
 }
 
+/** Requests in the platform's daily window (see dailyWindowMs). */
+function dailyRequestCount(platform: string, modelId: string, keyId: number, now: number): number {
+  const persisted = countPersistedRequests(platform, modelId, keyId, dailyWindowMs(platform, now), now);
+  if (persisted !== undefined) return persisted;
+  return memoryRequestCount(`${platform}:${modelId}:${keyId}:rpd`, dailyWindowMs(platform, now), now);
+}
+
 function tokenCount(
   platform: string,
   modelId: string,
@@ -307,6 +344,49 @@ function tokenCount(
   if (persisted !== undefined) return persisted;
   const type = windowMs === MINUTE ? 'tpm' : 'tpd';
   return memoryTokenCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now);
+}
+
+function dailyTokenCount(platform: string, modelId: string, keyId: number, now: number): number {
+  const persisted = sumPersistedTokens(platform, modelId, keyId, dailyWindowMs(platform, now), now);
+  if (persisted !== undefined) return persisted;
+  return memoryTokenCount(`${platform}:${modelId}:${keyId}:tpd`, dailyWindowMs(platform, now), now);
+}
+
+/**
+ * Earliest epoch ms at which the per-model request/token windows stop blocking
+ * this key, or null when they are not blocking it now. Used to give an exhausted
+ * caller a real retry time when the binding gate is our own ledger (no cooldown
+ * row exists then, so the soonest-cooldown lookup has nothing to report).
+ * Approximate on purpose: per-minute gates report the window end, daily gates
+ * report the platform reset (Pacific midnight for Google) or the moment the
+ * oldest counted request ages out of the sliding 24h window.
+ */
+export function windowsReopenAtMs(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  limits: WindowLimits,
+  estimatedTokens = 1,
+  now = Date.now(),
+): number | null {
+  const inFlight = provisionalRequests(platform, modelId, keyId, now);
+  const inFlightTokens = provisionalTokens(platform, modelId, keyId, now);
+  const dayBlocked =
+    (limits.rpd !== null && dailyRequestCount(platform, modelId, keyId, now) + inFlight >= limits.rpd)
+    || (limits.tpd !== null && dailyTokenCount(platform, modelId, keyId, now) + inFlightTokens + estimatedTokens > limits.tpd);
+  if (dayBlocked) {
+    if (platform === 'google') return now - msSincePacificMidnight(now) + DAY;
+    const oldest = withDb(db => (db.prepare(`
+      SELECT MIN(created_at_ms) AS oldest FROM rate_limit_usage
+       WHERE platform = ? AND model_id = ? AND key_id = ? AND created_at_ms > ?
+    `).get(platform, modelId, keyId, now - DAY) as { oldest: number | null }).oldest);
+    // No recorded row means only in-flight leases block it; they settle in seconds.
+    return oldest == null ? now + MINUTE : oldest + DAY;
+  }
+  const minuteBlocked =
+    (limits.rpm !== null && requestCount(platform, modelId, keyId, MINUTE, now) + inFlight >= limits.rpm)
+    || (limits.tpm !== null && tokenCount(platform, modelId, keyId, MINUTE, now) + inFlightTokens + estimatedTokens > limits.tpm);
+  return minuteBlocked ? now + MINUTE : null;
 }
 
 export function canMakeRequest(
@@ -325,7 +405,7 @@ export function canMakeRequest(
   }
 
   if (limits.rpd !== null) {
-    if (requestCount(platform, modelId, keyId, DAY, now) + inFlight >= limits.rpd) return false;
+    if (dailyRequestCount(platform, modelId, keyId, now) + inFlight >= limits.rpd) return false;
   }
 
   return true;
@@ -348,7 +428,7 @@ export function canUseTokens(
   }
 
   if (limits.tpd !== null) {
-    const used = tokenCount(platform, modelId, keyId, DAY, now);
+    const used = dailyTokenCount(platform, modelId, keyId, now);
     if (used + inFlight + estimatedTokens > limits.tpd) return false;
   }
 
@@ -1126,9 +1206,9 @@ export function getCooldownDecisionForLimit(
   const quotaSignal = opts?.quotaSignal ?? true;
   const now = Date.now();
   const rpdExhausted =
-    limits.rpd !== null && requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd;
+    limits.rpd !== null && dailyRequestCount(platform, modelId, keyId, now) >= limits.rpd;
   const tpdExhausted =
-    limits.tpd !== null && tokenCount(platform, modelId, keyId, DAY, now) >= limits.tpd;
+    limits.tpd !== null && dailyTokenCount(platform, modelId, keyId, now) >= limits.tpd;
   // No daily quota published → use repeated-429 heuristic: 2+ 429s in the
   // last hour is treated as effectively daily-exhausted. This unsticks
   // providers that publish no daily cap (ollama, cloudflare, etc.) from the
@@ -1247,6 +1327,12 @@ export function setCooldown(
   const expiresAtMs = now + durationMs;
   cooldowns.set(key, expiresAtMs);
   persistCooldown(platform, modelId, keyId, expiresAtMs, source, now);
+}
+
+/** Expiry (epoch ms) of an active cooldown on this model+key, or null. */
+export function cooldownExpiresAtMs(platform: string, modelId: string, keyId: number): number | null {
+  if (!isOnCooldown(platform, modelId, keyId)) return null;
+  return cooldowns.get(`${platform}:${modelId}:${keyId}:cooldown`) ?? null;
 }
 
 export function isOnCooldown(platform: string, modelId: string, keyId: number): boolean {
@@ -1446,7 +1532,7 @@ export function getRateLimitStatus(
 
   return {
     rpm: { used: requestCount(platform, modelId, keyId, MINUTE, now), limit: limits.rpm },
-    rpd: { used: requestCount(platform, modelId, keyId, DAY, now), limit: limits.rpd },
+    rpd: { used: dailyRequestCount(platform, modelId, keyId, now), limit: limits.rpd },
     tpm: { used: tokenCount(platform, modelId, keyId, MINUTE, now), limit: limits.tpm },
   };
 }

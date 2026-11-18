@@ -14,6 +14,8 @@ import {
   releaseLease,
   getSoonestCooldownExpiry,
   modelWindowUsedFraction,
+  cooldownExpiresAtMs,
+  windowsReopenAtMs,
 } from './ratelimit.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
@@ -52,11 +54,30 @@ class RouteError extends Error {
   // synchronous "all exhausted" throw, where NO upstream was tried and nothing
   // else logs WHY the pool was empty (issue _1: opaque routing_error 429).
   diagnostics?: string[];
-  constructor(message: string, status: number, diagnostics?: string[]) {
+  // Earliest epoch ms at which one of the keys considered for THIS request
+  // stops being blocked (cooldown expiry, rate window reopening, daily reset).
+  // Scoped to the request's own candidates: the global soonest-cooldown lookup
+  // reported unrelated models, and nothing at all when the binding gate was our
+  // own rpd/tpd ledger rather than a cooldown row.
+  retryAtMs?: number;
+  constructor(message: string, status: number, diagnostics?: string[], retryAtMs?: number) {
     super(message);
     this.status = status;
     this.diagnostics = diagnostics;
+    this.retryAtMs = retryAtMs;
   }
+}
+
+/** Collects the soonest time any skipped key becomes usable again. */
+interface ReopenTracker { atMs: number | null }
+
+function noteReopen(tracker: ReopenTracker | undefined, atMs: number | null): void {
+  if (!tracker || atMs == null) return;
+  if (tracker.atMs == null || atMs < tracker.atMs) tracker.atMs = atMs;
+}
+
+function nextUtcMidnightMs(now: number): number {
+  return new Date(now).setUTCHours(24, 0, 0, 0);
 }
 
 // Human-readable retry ETA from a cooldown expiry timestamp (#423). Null when
@@ -1519,7 +1540,7 @@ function cachedDecrypt(keyId: number, ct: string, iv: string, authTag: string): 
   return plain;
 }
 
-function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[]): RouteResult | null {
+function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[], reopen?: ReopenTracker): RouteResult | null {
   const db = getDb();
   const label = `${entry.platform}/${entry.model_id}`;
 
@@ -1597,19 +1618,32 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
     if (skipKeys?.has(skipId)) { note('already-failed-this-request'); continue; }
 
-    if (isOnCooldown(entry.platform, entry.model_id, key.id)) { note('cooldown'); continue; }
-    if (!canUseProvider(entry.platform, key.id)) { note('provider-daily-cap'); continue; }
+    const now = Date.now();
+    if (isOnCooldown(entry.platform, entry.model_id, key.id)) {
+      note('cooldown');
+      noteReopen(reopen, cooldownExpiresAtMs(entry.platform, entry.model_id, key.id));
+      continue;
+    }
+    if (!canUseProvider(entry.platform, key.id)) { note('provider-daily-cap'); noteReopen(reopen, nextUtcMidnightMs(now)); continue; }
     // Account-wide per-minute budget, checked before the per-model gates: a model
     // with a NULL rpm_limit would otherwise sail past them and spend a budget its
     // siblings share.
-    if (!canUseProviderMinute(entry.platform, key.id)) { note('provider-minute-cap'); continue; }
+    if (!canUseProviderMinute(entry.platform, key.id)) { note('provider-minute-cap'); noteReopen(reopen, now + 60_000); continue; }
     // Skip a key that already has its allowed requests in the air. Without this,
     // parallel streams all pick the same key and 429 each other on providers that
     // meter concurrency per credential.
-    if (!canUseKeyConcurrency(entry.platform, key.id)) { note('key-concurrency'); continue; }
-    if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) { note('rpm/rpd-limit'); continue; }
-    if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) { note('tpm/tpd-limit'); continue; }
-    if (!canUseProviderTokens(entry.platform, key.id, entry.model_id, estimatedTokens)) { note('provider-daily-token-cap'); continue; }
+    if (!canUseKeyConcurrency(entry.platform, key.id)) { note('key-concurrency'); noteReopen(reopen, now + 60_000); continue; }
+    if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) {
+      note('rpm/rpd-limit');
+      noteReopen(reopen, windowsReopenAtMs(entry.platform, entry.model_id, key.id, limits, estimatedTokens, now));
+      continue;
+    }
+    if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) {
+      note('tpm/tpd-limit');
+      noteReopen(reopen, windowsReopenAtMs(entry.platform, entry.model_id, key.id, limits, estimatedTokens, now));
+      continue;
+    }
+    if (!canUseProviderTokens(entry.platform, key.id, entry.model_id, estimatedTokens)) { note('provider-daily-token-cap'); noteReopen(reopen, nextUtcMidnightMs(now)); continue; }
     // Monthly budget (#1158): a key whose request/token caps are spent for the
     // current UTC month is not a candidate — same skip semantics as the daily
     // gates above. The Retry-After (next-month boundary) surfaces through the
@@ -1928,6 +1962,65 @@ export function resolveModelGroupCandidates(
   return orderChain(rows, strategy);
 }
 
+/** Most fallback ids honored from one X-Fallback-Models header. */
+export const MAX_FALLBACK_MODELS = 8;
+
+/**
+ * Parse an `X-Fallback-Models` header value ("a, b, auto") into at most
+ * MAX_FALLBACK_MODELS distinct, non-empty model ids, in the client's order.
+ */
+export function parseFallbackModels(header: string | string[] | undefined): string[] {
+  const raw = Array.isArray(header) ? header.join(',') : header ?? '';
+  const ids: string[] = [];
+  for (const part of raw.split(',')) {
+    const id = part.trim();
+    if (id && id.length <= 200 && !ids.includes(id)) ids.push(id);
+    if (ids.length >= MAX_FALLBACK_MODELS) break;
+  }
+  return ids;
+}
+
+/**
+ * Extend a strictly pinned chain with client-named fallback models. Each
+ * fallback id becomes its own lower TIER (match_tier), so it can only serve once
+ * every earlier tier is exhausted — the pinned model's whole key pool first,
+ * then the first fallback's pool, and so on. `auto` / `auto:<chain>` appends
+ * that routing chain as the last resort. Unknown or disabled ids are skipped:
+ * a fallback list is a preference, and a typo in it must not fail a request the
+ * primary could serve.
+ */
+export function appendFallbackCandidates(primary: ChainRow[], fallbackIds: string[]): ChainRow[] {
+  const db = getDb();
+  const out = [...primary];
+  const seen = new Set(primary.map(r => r.model_db_id));
+  let tier = Math.max(0, ...primary.map(r => r.match_tier ?? 0));
+  for (const id of fallbackIds) {
+    let rows: ChainRow[];
+    const lower = id.toLowerCase();
+    if (lower === 'auto' || lower.startsWith('auto:')) {
+      try {
+        rows = resolveRoutingChain(id).chain.filter(r => r.enabled).map(r => ({ ...r }));
+      } catch {
+        continue;
+      }
+    } else {
+      const memberIds = isUnifyEnabled()
+        ? resolveRequestedIdForDispatch(id, getModelGroups())?.memberDbIds ?? []
+        : (db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').all(id) as { id: number }[]).map(r => r.id);
+      rows = memberIds.length > 0 ? resolveModelGroupCandidates(memberIds) : [];
+    }
+    rows = rows.filter(r => !seen.has(r.model_db_id));
+    if (rows.length === 0) continue;
+    tier += 1;
+    for (const row of rows) {
+      row.match_tier = tier;
+      seen.add(row.model_db_id);
+      out.push(row);
+    }
+  }
+  return out;
+}
+
 // A panel candidate surfaced to the fusion layer: enough to pick a diverse set
 // and resolve each to a pinned dispatch.
 export interface FusionCandidate {
@@ -2218,6 +2311,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   // through with no route — the only record of WHY the pool was empty on the
   // synchronous "all exhausted" path (nothing downstream logs it). See issue _1.
   const diag: string[] = [];
+  const reopen: ReopenTracker = { atMs: null };
 
   // Margin as a SOFT preference (#956 review): /v1/models advertises the raw
   // window, so clients legitimately pack requests right up to it — excluding
@@ -2311,16 +2405,18 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // first usable key's RouteResult, or null when the model has no key that
     // can serve right now — in which case we fall through to the next model in
     // the sorted chain for THIS request (no explicit penalty needed).
-    const route = selectKeyForModel(entry, estimatedTokens, skipKeys, diag);
+    const route = selectKeyForModel(entry, estimatedTokens, skipKeys, diag, reopen);
     if (route) return route;
   }
 
   // The aggregate keyless line rides in diagnostics but NOT in the summary's
   // route count: those models were never candidates for this request.
+  const retryAtMs = reopen.atMs ?? getSoonestCooldownExpiry() ?? undefined;
   throw new RouteError(
-    summarizeExhaustion(diag, getSoonestCooldownExpiry(), Date.now(), keylessSkipped),
+    summarizeExhaustion(diag, retryAtMs, Date.now(), keylessSkipped),
     429,
     keylessLine ? [...diag, keylessLine] : diag,
+    retryAtMs,
   );
 }
 
