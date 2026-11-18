@@ -17,6 +17,7 @@ This is the user entry point — start here to install the gateway, call the Ope
 ## More
 
 - [Android with Termux](install/02-android-termux.md) — experimental local installation using Node's built-in SQLite driver.
+- [Key pools and capacity](CAPACITY.md): how keys add capacity, Google per-project quotas, `X-Fallback-Models`, `GET /v1/capacity` and the knobs.
 - [Fallback chains](fallback/01-named-chains.md) — named fallback-chain lifecycle, empty-chain authoritative 400, `auto:<name>` routing, and catalog-sync backfill.
 - [Docker deployment](../../docker/README.md) — container configuration and persistent storage.
 - [Desktop app](../../desktop/README.md) — build and package the Electron application.
