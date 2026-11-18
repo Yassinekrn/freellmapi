@@ -3,7 +3,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ChatToolCall, TokenUsage } from '@freellmapi/shared/types.js';
-import { type RouteResult, type ResolvedChain, type ChainRow, routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, hasEnabledVisionModel, hasEnabledToolsModel, routingReserveTokens } from '../services/router.js';
+import { type RouteResult, type ResolvedChain, type ChainRow, routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, hasEnabledVisionModel, hasEnabledToolsModel, routingReserveTokens, parseFallbackModels, appendFallbackCandidates } from '../services/router.js';
 import { secondsUntilNextMonth } from '../services/key-budget.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { runRerank, RerankError, rerankRetryAfterSec } from '../services/rerank.js';
@@ -37,7 +37,7 @@ import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { buildModelListing, type NormalizedModel } from '../services/model-listing.js';
-import { claudeFamilyDiscoveryEntries } from '../services/anthropic-map.js';
+import { claudeFamilyDiscoveryEntries, resolveClaudeAliasForChat } from '../services/anthropic-map.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
 export const proxyRouter = Router();
@@ -1595,8 +1595,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { model: requestedModel, temperature, top_p, stream } = parsed.data;
-  const requestedModelLabel = requestedModel ?? 'auto';
+  const { model: clientModel, temperature, top_p, stream } = parsed.data;
+  // Claude family ids are listed by GET /v1/models; dispatch them the way
+  // /v1/messages does instead of 404ing a listed id.
+  const requestedModel = resolveClaudeAliasForChat(clientModel);
+  const requestedModelLabel = clientModel ?? 'auto';
   // Agent-tolerant knob normalization (#200): max_tokens <= 0 means "no
   // limit" in several clients → unset; tool_choice 'any' is OpenAI's
   // 'required'; tool definitions get their 'function' type re-defaulted.
@@ -2187,6 +2190,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         return;
       }
+    }
+    // A pin is strict (#335): it never reaches another model on its own. The
+    // client can name ordered siblings to try once the pinned model's whole key
+    // pool is exhausted, e.g. `X-Fallback-Models: gemini-2.5-flash, auto`.
+    const fallbackIds = parseFallbackModels(req.headers['x-fallback-models']);
+    if (fallbackIds.length > 0) {
+      const primary = groupChain ?? (preferredModel != null ? resolveModelGroupCandidates([preferredModel]) : []);
+      groupChain = appendFallbackCandidates(primary, fallbackIds);
     }
   } else {
     preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);

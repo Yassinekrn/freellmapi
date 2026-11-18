@@ -120,6 +120,24 @@ export function resolveAnthropicModel(model?: string): ResolvedAnthropicModel {
   return row ? { preferredModelDbId: row.id, modelId: row.model_id, pinned: true } : { pinned: false };
 }
 
+/**
+ * The model an OpenAI-shaped surface should dispatch for a Claude-looking id.
+ *
+ * GET /v1/models lists the Claude family aliases (#880), but only /v1/messages
+ * used to understand them: /v1/chat/completions answered a listed id with a 404
+ * "not in the catalog". A `claude*` id that is not a real catalog row now maps to
+ * what /v1/messages would route it to — the operator's pinned family target, or
+ * `auto`. Every other id is returned unchanged.
+ */
+export function resolveClaudeAliasForChat(model: string | undefined): string | undefined {
+  const trimmed = model?.trim();
+  if (!trimmed || !/^claude/i.test(trimmed)) return model;
+  const isCatalogRow = getDb().prepare('SELECT 1 FROM models WHERE model_id = ? LIMIT 1').get(trimmed);
+  if (isCatalogRow) return model;
+  const resolved = resolveAnthropicModel(trimmed);
+  return resolved.pinned && resolved.modelId ? resolved.modelId : 'auto';
+}
+
 // The canonical Claude id this gateway answers to for each family, and the
 // label discovery shows for it.
 //

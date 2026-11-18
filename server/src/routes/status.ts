@@ -7,6 +7,7 @@ import { extractApiToken, timingSafeStringEqual } from './proxy.js';
 import { getProvider } from '../providers/index.js';
 import { getSoonestCooldownExpiry } from '../services/ratelimit.js';
 import { getQuotaStateForKeys } from '../services/provider-quota.js';
+import { buildCapacityReport } from '../services/capacity-report.js';
 import {
   getQuotaForecast,
   LOW_BALANCE_THRESHOLD,
@@ -211,6 +212,30 @@ providersRouter.get('/providers', (req: Request, res: Response) => {
     });
 
   res.json({ providers, counts });
+});
+
+// GET /v1/capacity — per-model, per-key pool state: which keys can serve each
+// model right now, requests spent in the current minute/day windows, cooldowns
+// with their expiry, when a blocked key reopens, and each key's last upstream
+// error (redacted). Same unified-key auth as /v1/providers; keys are named by
+// id and operator label only, never by value. Optional `?model=` and
+// `?platform=` filters; `?only_blocked=true` keeps models with no ready key.
+providersRouter.get('/capacity', (req: Request, res: Response) => {
+  const token = extractApiToken(req);
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
+    return;
+  }
+
+  const model = typeof req.query.model === 'string' && req.query.model ? req.query.model : undefined;
+  const platform = typeof req.query.platform === 'string' && req.query.platform ? req.query.platform : undefined;
+  const onlyBlocked = ['1', 'true', 'yes'].includes(String(req.query.only_blocked ?? '').toLowerCase());
+  const models = buildCapacityReport({ model, platform });
+  res.json({
+    generated_at: new Date().toISOString(),
+    models: onlyBlocked ? models.filter(m => m.keys_ready === 0) : models,
+  });
 });
 
 // GET /quota-forecast — per-pool daily headroom + low-balance warning (#1104).
